@@ -1,0 +1,54 @@
+name: Tester L4 validation only
+
+on:
+  push:
+    branches: [tester-validation-l4-b71e25c8]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout validation controller
+        uses: actions/checkout@v4
+        with:
+          path: controller
+
+      - name: Checkout immutable candidate
+        uses: actions/checkout@v4
+        with:
+          repository: ssss141414/winml-cli
+          ref: d951fccaba37275540cdf2757bfb6b3cf60e8ec8
+          path: candidate
+
+      - name: Assert immutable candidate provenance
+        shell: pwsh
+        run: |
+          $head = git -C candidate rev-parse HEAD
+          $parent = git -C candidate rev-parse HEAD^
+          if ($head -ne 'd951fccaba37275540cdf2757bfb6b3cf60e8ec8') { throw "HEAD mismatch: $head" }
+          if ($parent -ne '3708969b731425b0c6d4b97920d1b5e6519bb013') { throw "parent mismatch: $parent" }
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Set up Python
+        run: uv python install 3.11
+
+      - name: Run complete tester acceptance
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python controller/.github/tester/hosted_l4_controller.py
+
+      - name: Upload complete tester evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tester-l4-d951fcca-evidence
+          path: hosted-evidence
+          if-no-files-found: error
+          retention-days: 7
