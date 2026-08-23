@@ -28,7 +28,7 @@ jobs:
         shell: pwsh
         run: |
           $head = git -C candidate rev-parse HEAD
-          $parent = git -C candidate rev-parse HEAD^
+          $parent = git -C candidate rev-parse HEAD~1
           if ($head -ne 'd951fccaba37275540cdf2757bfb6b3cf60e8ec8') { throw "HEAD mismatch: $head" }
           if ($parent -ne '3708969b731425b0c6d4b97920d1b5e6519bb013') { throw "parent mismatch: $parent" }
 
