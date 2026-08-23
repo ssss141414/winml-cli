@@ -22,6 +22,7 @@ jobs:
         with:
           repository: ssss141414/winml-cli
           ref: d951fccaba37275540cdf2757bfb6b3cf60e8ec8
+          fetch-depth: 2
           path: candidate
 
       - name: Assert immutable candidate provenance
