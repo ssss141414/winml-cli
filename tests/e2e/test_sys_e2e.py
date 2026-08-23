@@ -150,8 +150,10 @@ class TestSysJsonShape:
     """Validate the JSON output shape that downstream scripts depend on."""
 
     REQUIRED_TOP_KEYS: ClassVar[set[str]] = {
+        "schema_version",
         "python",
         "platform",
+        "memory",
         "libraries",
         "torch",
         "backends",
@@ -169,6 +171,14 @@ class TestSysJsonShape:
         data = _run_sys_json()
         assert re.match(r"^\d+\.\d+\.\d+", data["python"]["version"])
 
+    def test_default_json_has_versioned_physical_memory(self):
+        data = _run_sys_json()
+        assert data["schema_version"] == 1
+        physical_total_mib = data["memory"]["physical_total_mib"]
+        assert physical_total_mib is None or (
+            isinstance(physical_total_mib, int) and physical_total_mib > 0
+        )
+
     def test_default_json_devices_have_sequential_priority(self):
         """Devices come back with sequential 1-based priorities."""
         data = _run_sys_json()
@@ -180,14 +190,22 @@ class TestSysJsonShape:
                 f"Device priorities are not sequential 1..N: {priorities}"
             )
 
-    def test_default_json_eps_have_name_device_path(self):
+    def test_default_json_eps_have_source_entries(self):
         data = _run_sys_json()
         eps = data["executionProviders"]
-        assert isinstance(eps, list)
-        for ep in eps:
-            assert set(ep.keys()) >= {"name", "device", "path"}
-            assert isinstance(ep["name"], str) and ep["name"]
-            assert isinstance(ep["device"], str)
+        assert isinstance(eps, dict)
+        for ep_name, ep in eps.items():
+            assert isinstance(ep_name, str) and ep_name
+            assert isinstance(ep.get("entries"), list)
+            for entry in ep["entries"]:
+                assert set(entry) >= {
+                    "source_kind",
+                    "source_tag",
+                    "status",
+                    "dll_path",
+                    "devices",
+                }
+                assert isinstance(entry["devices"], list)
 
 
 # ---------------------------------------------------------------------------

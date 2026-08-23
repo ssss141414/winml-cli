@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from ..utils.constants import CompilerName, EPAlias, EPName
 
@@ -23,6 +23,7 @@ from ..utils.constants import CompilerName, EPAlias, EPName
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from ..session import EPDeviceTarget
     from ..utils.constants import EPNameOrAlias
 
 
@@ -35,6 +36,7 @@ class EPConfig:
     Attributes:
         provider: Target execution provider (qnn, cpu, cuda, dml)
         provider_options: EP-specific options as key=value dict
+        provider_option_file_keys: Provider option keys whose values are file paths
         enable_ep_context: Generate EPContext model with pre-compiled graph
         embed_context: Embed context in ONNX (True) or external .bin file (False)
         compiler: Compiler backend ("ort", "ort_session", or "qairt").
@@ -50,6 +52,7 @@ class EPConfig:
     compiler: CompilerName = "ort"
     qnn_sdk_root: Path | None = None
     device: str = "auto"
+    provider_option_file_keys: set[str] = field(default_factory=set)
 
 
 @dataclass
@@ -89,14 +92,60 @@ class WinMLCompileConfig:
     validate: bool = True
     verbose: bool = False
 
+    # Optional resolved EP+device binding (used by stages/compile.py to align
+    # EPContext filenames with the actual runtime-resolved device).
+    ep_device: "EPDeviceTarget | None" = None
+
+    def __post_init__(self) -> None:
+        """Normalize serialized resolved-target overrides at construction."""
+        raw_ep_device: Any = self.ep_device
+        if isinstance(raw_ep_device, dict):
+            from ..session import EPDeviceTarget
+
+            self.ep_device = EPDeviceTarget.from_dict(raw_ep_device)
+
     @property
     def device(self) -> str:
         """Get device/provider name for backward compatibility."""
         return self.ep_config.provider or ""
 
     @classmethod
+    def for_ep_device(cls, ep_device: Any) -> WinMLCompileConfig | None:
+        """Factory for a fully-resolved (EP, device) binding.
+
+        Args:
+            ep_device: EPDeviceTarget or similar with .ep / .device attrs.
+
+        Returns:
+            WinMLCompileConfig bound to the given target, or None when its EP
+            has no offline EPContext compiler.
+        """
+        from ..session import EPDeviceTarget, short_ep_name
+
+        target = (
+            ep_device
+            if isinstance(ep_device, EPDeviceTarget)
+            else EPDeviceTarget(
+                ep=ep_device.ep,
+                device=ep_device.device,
+                source=getattr(ep_device, "source", None),
+            )
+        )
+
+        # short_ep_name returns a broad str; it is a valid EP short alias here.
+        provider = short_ep_name(target.ep)
+        base = cls.for_provider(cast("EPNameOrAlias", provider), device=target.device)
+        if base is None:
+            return None
+        base.ep_device = target
+        return base
+
+    @classmethod
     def for_provider(
-        cls, provider: EPNameOrAlias | None, device: str | None = None
+        cls,
+        provider: EPNameOrAlias | None,
+        device: str | None = None,
+        quantize: bool | None = None,
     ) -> WinMLCompileConfig | None:
         """Factory that dispatches to a known for_* method or creates a generic config.
 
@@ -109,15 +158,23 @@ class WinMLCompileConfig:
                 in provider_options so CPU and GPU builds get different cache keys.
 
         Returns:
-            WinMLCompileConfig for the provider, or None if provider is None.
+            WinMLCompileConfig for providers that support offline EPContext
+            compilation, otherwise None.
         """
+        import warnings
+
         from ..utils.constants import normalize_ep_name
 
+        if quantize is not None:
+            warnings.warn(
+                "The 'quantize' parameter is deprecated and ignored. "
+                "Use WinMLQuantizationConfig for quantization settings.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         if provider is None:
             return None
         canonical = normalize_ep_name(provider)
-        if canonical is None:
-            return None
         factories: dict[EPName, Callable[[], WinMLCompileConfig]] = {
             "QNNExecutionProvider": lambda: cls.for_qnn(device=device),
             "DmlExecutionProvider": cls.for_dml,
@@ -130,13 +187,10 @@ class WinMLCompileConfig:
         }
         factory = factories.get(canonical)
         if factory is None:
-            # Not a known EP — no typed EPConfig possible.
+            # Custom/unknown EP — no EPContext assumed → skip offline compile.
             return None
         config = factory()
-        # EPs that don't produce EPContext have no offline compile step
-        if not config.ep_config.enable_ep_context:
-            return None
-        return config
+        return config if config.ep_config.enable_ep_context else None
 
     @classmethod
     def for_qnn(cls, device: str | None = None) -> WinMLCompileConfig:
@@ -186,7 +240,7 @@ class WinMLCompileConfig:
     def for_nv_tensorrt_rtx(cls, device: str | None = None) -> WinMLCompileConfig:
         """Factory for NvTensorRTRTX compilation."""
         ep_cfg = EPConfig(
-            provider="nv_tensorrt_rtx",
+            provider="nvtensorrtrtx",
             enable_ep_context=True,
             device=device or "auto",
         )
@@ -222,18 +276,21 @@ class WinMLCompileConfig:
         from pathlib import Path as _Path
 
         provider_options: dict[str, str] = {}
+        provider_option_file_keys: set[str] = set()
         ryzen_ai = os.environ.get("RYZEN_AI_INSTALLATION_PATH")
         if ryzen_ai:
             xclbin = _Path(ryzen_ai) / "voe-4.0-win_amd64" / "xclbins" / "phoenix" / "4x4.xclbin"
             if xclbin.exists():
                 provider_options["target"] = "X1"
                 provider_options["xclbin"] = str(xclbin)
+                provider_option_file_keys.add("xclbin")
                 provider_options["xlnx_enable_py3_round"] = "0"
         ep_cfg = EPConfig(
             provider="vitisai",
             enable_ep_context=True,
             provider_options=provider_options,
             device=device or "auto",
+            provider_option_file_keys=provider_option_file_keys,
         )
         return cls(ep_config=ep_cfg)
 
@@ -253,6 +310,7 @@ class WinMLCompileConfig:
         return {
             "execution_provider": self.ep_config.provider,
             "provider_options": self.ep_config.provider_options,
+            "provider_option_file_keys": sorted(self.ep_config.provider_option_file_keys),
             "enable_ep_context": self.ep_config.enable_ep_context,
             "embed_context": self.ep_config.embed_context,
             "compiler": self.ep_config.compiler,
@@ -260,15 +318,19 @@ class WinMLCompileConfig:
                 str(self.ep_config.qnn_sdk_root) if self.ep_config.qnn_sdk_root else None
             ),
             "device": self.ep_config.device,
+            "ep_device": self.ep_device.to_dict() if self.ep_device is not None else None,
             "validate": self.validate,
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> WinMLCompileConfig:
         """Create from dictionary. Unknown keys are ignored."""
+        from ..session import EPDeviceTarget
+
         ep_config = EPConfig(
             provider=data.get("execution_provider"),
             provider_options=data.get("provider_options", {}),
+            provider_option_file_keys=set(data.get("provider_option_file_keys", [])),
             enable_ep_context=data.get("enable_ep_context", True),
             embed_context=data.get("embed_context", False),
             compiler=data.get("compiler", "ort"),
@@ -280,4 +342,9 @@ class WinMLCompileConfig:
             ep_config=ep_config,
             validate=data.get("validate", True),
             verbose=data.get("verbose", False),
+            ep_device=(
+                EPDeviceTarget.from_dict(data["ep_device"])
+                if data.get("ep_device") is not None
+                else None
+            ),
         )

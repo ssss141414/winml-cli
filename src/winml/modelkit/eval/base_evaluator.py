@@ -17,16 +17,26 @@ if TYPE_CHECKING:
     from datasets import Dataset
     from transformers.pipelines.base import Pipeline
 
-    from ..models.winml.base import WinMLPreTrainedModel
-    from ..models.winml.composite_model import WinMLCompositeModel
     from .config import DatasetConfig, WinMLEvaluationConfig
 
 logger = logging.getLogger(__name__)
 
-# Tasks not supported as HF pipeline tasks, mapped to their pipeline equivalent.
-_PIPELINE_TASK_MAP: dict[str, str] = {
-    "sentence-similarity": "feature-extraction",
-}
+
+def _ensure_evaluate_transformers_compat() -> None:
+    """Restore the TensorFlow model marker expected by ``evaluate``."""
+    import transformers
+
+    if hasattr(transformers, "TFPreTrainedModel"):
+        return
+
+    class TFPreTrainedModel:
+        pass
+
+    lazy_objects = getattr(transformers, "_objects", None)
+    if isinstance(lazy_objects, dict):
+        lazy_objects["TFPreTrainedModel"] = TFPreTrainedModel
+    else:
+        transformers.__dict__["TFPreTrainedModel"] = TFPreTrainedModel
 
 
 class WinMLEvaluator:
@@ -35,7 +45,7 @@ class WinMLEvaluator:
     def __init__(
         self,
         config: WinMLEvaluationConfig,
-        model: WinMLPreTrainedModel | WinMLCompositeModel,
+        model: Any,
     ) -> None:
         self.model = model
         self.config = config
@@ -46,6 +56,7 @@ class WinMLEvaluator:
         """Run evaluation and return metrics."""
         import inspect
 
+        _ensure_evaluate_transformers_compat()
         from evaluate import evaluator
 
         logger.info("Running evaluation...")
@@ -92,7 +103,17 @@ class WinMLEvaluator:
         try:
             ds_path = Path(ds.path).expanduser() if ds.path else None
             if ds_path and ds_path.is_dir():
-                dataset = load_from_disk(str(ds_path))
+                loaded = load_from_disk(str(ds_path))
+                if isinstance(loaded, Dataset):
+                    dataset = loaded
+                else:
+                    available_splits = sorted(str(name) for name in loaded)
+                    if ds.split not in loaded:
+                        raise DatasetValidationError(
+                            f"Local dataset '{ds.path}' has splits {available_splits}, "
+                            f"but split '{ds.split}' was requested"
+                        )
+                    dataset = loaded[ds.split]
             else:
                 dataset = load_dataset(
                     ds.path,
@@ -103,8 +124,7 @@ class WinMLEvaluator:
                 )
         except Exception as e:
             raise DatasetValidationError(
-                f"Failed to load dataset '{ds.path}' "
-                f"(name={ds.name!r}, split='{ds.split}'): {e}",
+                f"Failed to load dataset '{ds.path}' (name={ds.name!r}, split='{ds.split}'): {e}",
             ) from e
 
         if ds.streaming:
@@ -125,31 +145,25 @@ class WinMLEvaluator:
 
         assert self.config.task is not None, "config.task is required for evaluation"
         validate_dataset_columns(
-            dataset, self.config.task, self.config.dataset.columns_mapping,
+            dataset,
+            self.config.task,
+            self.config.dataset.columns_mapping,
         )
         return self.align_labels(dataset, ds)
 
     def prepare_pipeline(self) -> Pipeline:
         """Create HF pipeline for inference. Subclasses override to configure."""
-        from transformers import pipeline
+        from ..inference.pipeline import create_pipeline
 
         assert self.config.task is not None, "config.task is required to build pipeline"
-        pipeline_task = _PIPELINE_TASK_MAP.get(self.config.task, self.config.task)
-        # transformers.pipeline has 60+ Literal overloads — runtime task strings
-        # can't be statically matched. The string-task fallback handles unknown tasks.
         return cast(
             "Pipeline",
-            pipeline(  # type: ignore[call-overload, misc]  # 60+ Literal overloads + union model arg
-                pipeline_task,
-                model=self.model,
-                framework="pt",
-                tokenizer=self.config.model_id,
-                feature_extractor=self.config.model_id,
-                image_processor=self.config.model_id,
-                processor=self.config.model_id,
-                # "device" is for HF pipeline pytorch tensors, not ORT EP.
-                # WinMLSession handles device delegation for ORT.
-                device="cpu",
+            create_pipeline(
+                self.config.task,
+                self.model,
+                self.config.model_id,
+                device=self.config.pipeline_device,
+                trust_remote_code=self.config.trust_remote_code,
             ),
         )
 

@@ -6,32 +6,203 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
+import os
+import tempfile
+import threading
+import uuid
 from contextlib import contextmanager
+from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import onnxruntime as ort
+from filelock import FileLock, Timeout
+from google.protobuf.message import DecodeError
 
 from ..core.onnx_utils import get_io_config
-from ..onnx import is_compiled_onnx
-from ..utils.native_stderr import capture_native_stderr, suppress_native_stderr
-from .ep_registry import WinMLEPRegistry
+from ..onnx import get_onnx_model_hash, is_compiled_onnx
+from ..utils.native_stderr import (
+    get_win32_fd_handle,
+    get_win32_std_handle,
+    native_fd_redirect_lock,
+    refresh_click_windows_console_stream,
+    restore_redirected_fd,
+    set_win32_std_handle,
+    set_win32_std_handle_to_current_fd,
+)
+from .ep_device import (
+    WinMLEPMonitorMismatch,
+    expand_ep_name,
+    lookup_device_spec,
+)
+from .monitor.ep_monitor import WinMLEPMonitor
 from .stats import PerfStats
 
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Generator
+    from collections.abc import Callable, Iterator
+    from types import TracebackType
 
-    import onnx
+    from onnx import GraphProto, ModelProto, NodeProto, ValueInfoProto
 
     from ..compiler.configs import EPConfig
-    from ..utils.constants import EPName, EPNameOrAlias
+    from .ep_registry import WinMLEPDevice
 
 
 logger = logging.getLogger(__name__)
+
+_EPCONTEXT_THREAD_LOCKS_GUARD = threading.Lock()
+_EPCONTEXT_THREAD_LOCKS: dict[Path, threading.Lock] = {}
+_EPCONTEXT_CACHE_MAX_GENERATIONS = 4
+
+
+def _epcontext_thread_lock(lock_path: Path) -> threading.Lock:
+    """Return the process-local lock paired with one EPContext lockfile."""
+    resolved = lock_path.resolve(strict=False)
+    with _EPCONTEXT_THREAD_LOCKS_GUARD:
+        return _EPCONTEXT_THREAD_LOCKS.setdefault(resolved, threading.Lock())
+
+
+@dataclass
+class _EPContextCacheLease:
+    """Held cache lock that can be transferred from compile selection to runtime open."""
+
+    lock_path: Path
+    thread_lock: threading.Lock
+    file_lock: FileLock
+    _released: bool = False
+
+    @classmethod
+    def acquire(cls, lock_path: Path, *, blocking: bool = True) -> _EPContextCacheLease | None:
+        thread_lock = _epcontext_thread_lock(lock_path)
+        if not thread_lock.acquire(blocking=blocking):
+            return None
+        file_lock = FileLock(lock_path)
+        try:
+            if blocking:
+                file_lock.acquire()
+            else:
+                file_lock.acquire(timeout=0)
+        except Timeout:
+            thread_lock.release()
+            return None
+        except Exception:
+            thread_lock.release()
+            raise
+        return cls(lock_path=lock_path, thread_lock=thread_lock, file_lock=file_lock)
+
+    def release(self) -> None:
+        if self._released:
+            return
+        try:
+            self.file_lock.release()
+        finally:
+            self.thread_lock.release()
+            self._released = True
+
+    def __enter__(self) -> _EPContextCacheLease:
+        return self
+
+    def __exit__(
+        self,
+        _exc_type: type[BaseException] | None,
+        _exc: BaseException | None,
+        _tb: TracebackType | None,
+    ) -> None:
+        self.release()
+
+
+@dataclass
+class _PreparedEPContextModel:
+    """Model path selected for runtime loading plus any lock held until ORT opens it."""
+
+    path: Path
+    markerless: bool = False
+    lease: _EPContextCacheLease | None = None
+
+    @property
+    def lock_path(self) -> Path | None:
+        return self.lease.lock_path if self.lease is not None else None
+
+    def release(self) -> None:
+        if self.lease is not None:
+            self.lease.release()
+
+    def __enter__(self) -> _PreparedEPContextModel:
+        return self
+
+    def __exit__(
+        self,
+        _exc_type: type[BaseException] | None,
+        _exc: BaseException | None,
+        _tb: TracebackType | None,
+    ) -> None:
+        self.release()
+
+
+@contextmanager
+def _suppress_native_output(log_path: str | Path | None = None) -> Iterator[None]:
+    """Redirect native stdout to a log file (or devnull) for the block.
+
+    QNN SDK's compiler writes progress via native C++ stdout that Python's
+    logging can't intercept. Only stdout — stderr is left alone so Rich
+    displays and Python logging still work.
+    """
+    with native_fd_redirect_lock():
+        fd: int | None = None
+        old_stdout: int | None = None
+        old_win32_stdout = get_win32_std_handle(1)
+        old_fd_stdout = get_win32_fd_handle(1)
+        try:
+            if log_path is not None:
+                fd = os.open(str(log_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+            else:
+                fd = os.open(os.devnull, os.O_WRONLY)
+            old_stdout = os.dup(1)
+            os.dup2(fd, 1)
+        except OSError:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    logger.debug("Could not close native stdout suppression fd", exc_info=True)
+            if old_stdout is not None:
+                try:
+                    os.close(old_stdout)
+                except OSError:
+                    logger.debug("Could not close saved native stdout fd", exc_info=True)
+            logger.debug(
+                "Native stdout suppression setup failed; leaving stdout unchanged",
+                exc_info=True,
+            )
+            yield
+            return
+
+        assert old_stdout is not None
+        try:
+            os.close(fd)
+        except OSError:
+            logger.debug("Could not close native stdout suppression fd", exc_info=True)
+        set_win32_std_handle_to_current_fd(1)
+        try:
+            yield
+        finally:
+            restore_redirected_fd(1, old_stdout)
+            if old_win32_stdout is not None and old_win32_stdout != old_fd_stdout:
+                set_win32_std_handle(1, old_win32_stdout)
+                refresh_click_windows_console_stream(1, old_win32_stdout)
+            else:
+                set_win32_std_handle_to_current_fd(1)
+                refresh_click_windows_console_stream(1)
+            try:
+                os.close(old_stdout)
+            except OSError:
+                logger.debug("Could not close saved native stdout fd", exc_info=True)
 
 
 class SessionState(Enum):
@@ -43,13 +214,75 @@ class SessionState(Enum):
     ERROR = "ERROR"
 
 
-# Device to ORT policy mapping (no EP names - let ORT select provider)
-DEVICE_POLICY_MAP = {
-    "npu": ort.OrtExecutionProviderDevicePolicy.PREFER_NPU,
-    "gpu": ort.OrtExecutionProviderDevicePolicy.PREFER_GPU,
-    "cpu": ort.OrtExecutionProviderDevicePolicy.PREFER_CPU,
-    "auto": ort.OrtExecutionProviderDevicePolicy.PREFER_NPU,  # Default to NPU
-}
+@dataclass(frozen=True)
+class PerfContext:
+    """Per-perf-window stats container yielded by ``WinMLSession.perf()``.
+
+    Aggregates perf statistics and the optional attached EP monitor.
+    Frozen: mutation is not a supported pattern — update the underlying
+    objects instead.
+    """
+
+    stats: PerfStats
+    monitor: WinMLEPMonitor  # NullEPMonitor when no monitor was passed
+
+    def __getattr__(self, name: str) -> Any:
+        """Delegate legacy direct statistics access to :attr:`stats`."""
+        return getattr(self.stats, name)
+
+
+def _ep_defaults(ep_device: WinMLEPDevice) -> dict[str, str]:
+    """EP-specific defaults from the EPDeviceSpec catalog.
+
+    Most EPs return {} — they pick up settings via ep_config.provider_options
+    and ep_monitor.get_provider_options(). Only EPs that have measured
+    default_provider_options in EP_DEVICE_SPECS contribute non-empty results.
+
+    Note: QNNExecutionProvider does NOT need ``backend_type`` here.
+    When using ``add_provider_for_devices()``, the OrtEpDevice handle already
+    encodes the backend target (NPU→HTP, GPU→GPU, CPU→CPU). Passing
+    ``backend_type`` explicitly crashes ORT 1.23.5 with a native exit 127.
+
+    Returns a fresh dict copy so callers can mutate without aliasing the
+    catalog entry's immutable Mapping.
+    """
+    spec = lookup_device_spec(ep_device.device.ep_name, ep_device.device.device_type.lower())
+    return dict(spec.default_provider_options) if spec else {}
+
+
+def _build_provider_options(
+    ep_device: WinMLEPDevice,
+    ep_config: EPConfig | None,
+    ep_monitor: WinMLEPMonitor | None,
+) -> dict[str, str]:
+    """Flat provider_options for add_provider_for_devices().
+
+    Three layers, each overrides the previous:
+      1. EP-specific defaults from ep_device (e.g. QNN backend_type).
+      2. User overrides from ep_config.provider_options.
+      3. WinMLEPMonitor-required options (e.g. QNN profiling_level).
+
+    Monitor wins last because tracing correctness depends on its options
+    actually reaching the EP. Callers who want to disable tracing should
+    drop the monitor, not override its keys.
+    """
+    options: dict[str, str] = _ep_defaults(ep_device)
+    if ep_config is not None and getattr(ep_config, "provider_options", None):
+        options.update(ep_config.provider_options)
+    if ep_monitor is not None:
+        options.update(ep_monitor.get_provider_options())
+    return options
+
+
+def _overlay_options(
+    baseline: dict[str, str],
+    overrides: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """Return a copy of ``baseline`` with optional override values applied."""
+    merged = dict(baseline)
+    if overrides:
+        merged.update(overrides)
+    return merged
 
 
 class WinMLSessionError(Exception):
@@ -80,122 +313,182 @@ class CompilationError(WinMLSessionError):
     """Compilation failed."""
 
 
-class DeviceNotAvailableError(WinMLSessionError):
-    """Requested device not available."""
-
-
 class InferenceError(WinMLSessionError):
     """Inference failed."""
 
 
-class NotCompiledError(WinMLSessionError):
-    """Session not compiled."""
+def _build_session_options(
+    ep_device: WinMLEPDevice,
+    ep_config: EPConfig | None = None,
+    ep_monitor: WinMLEPMonitor | None = None,
+    session_options_factory: Callable[[], ort.SessionOptions] | None = None,
+    session_option_entries: dict[str, str] | None = None,
+    provider_options: dict[str, str] | None = None,
+) -> ort.SessionOptions:
+    """Build a fully-bound ort.SessionOptions for one WinMLEPDevice pair.
+
+    Free function (not a method): pure inputs -> pure outputs. The caller
+    (typically :meth:`WinMLEPRegistry.auto_device`) has already resolved
+    the (source, device) pair, so no registry / handle filtering happens
+    here.
+    """
+    so = session_options_factory() if session_options_factory is not None else ort.SessionOptions()
+
+    if session_option_entries is None and ep_monitor is not None:
+        session_option_entries = dict(ep_monitor.get_session_options())
+
+    if session_option_entries is not None:
+        for key, value in session_option_entries.items():
+            so.add_session_config_entry(key, value)
+
+    handle = ep_device.device._ort
+    options = (
+        dict(provider_options)
+        if provider_options is not None
+        else _build_provider_options(ep_device, ep_config, ep_monitor)
+    )
+    logger.info(
+        "Building session options for ep=%s device=%s with provider_option_keys=%s",
+        ep_device.ep.arg0,
+        ep_device.device.device_type,
+        sorted(options),
+    )
+    logger.debug("Session provider options: %s", options)
+    so.add_provider_for_devices([handle], options)
+    return so
 
 
 class WinMLSession:
-    """ONNX Runtime session manager with WinML EP integration.
-
-    Features:
-    - Policy-based device selection (PREFER_NPU, PREFER_GPU, PREFER_CPU)
-    - EPContext persistence (JIT-compiled model cache)
-    - One session = One EP (immutable binding)
-
-    Note:
-        WinMLSession does NOT use explicit EP provider names. Instead, it uses
-        ORT's OrtExecutionProviderDevicePolicy to let the runtime automatically
-        select the best available provider.
-
-    Usage:
-        session = WinMLSession("model.onnx", device="npu")
-        outputs = session.run({"input": tensor})
-    """
-
-    # Class-level flag for one-time EP initialization
-    _eps_initialized: bool = False
-
-    @classmethod
-    def _init_winml_eps_once(cls) -> None:
-        """Initialize WinML EP registry once at class level."""
-        if cls._eps_initialized:
-            return
-
-        try:
-            registry = WinMLEPRegistry.get_instance()
-            if registry.winml_available:
-                with suppress_native_stderr():
-                    registered = registry.register_to_ort()
-                logger.info("WinML EPs registered: %s", registered)
-        except Exception as e:
-            logger.debug("WinML EP init skipped: %s", e)
-        finally:
-            cls._eps_initialized = True
+    """ONNX Runtime session bound to one resolved :class:`WinMLEPDevice`."""
 
     def __init__(
         self,
         onnx_path: str | Path,
-        device: str = "auto",
-        ep_config: EPConfig | None = None,
+        ep_device: WinMLEPDevice | str | None = None,
         *,
-        ep: EPNameOrAlias | None = None,
+        device: str | None = None,
+        ep: str | None = None,
         provider_options: dict[str, str] | None = None,
+        ep_config: EPConfig | None = None,
+        ep_monitor: WinMLEPMonitor | None = None,
         session_options: Callable[[], ort.SessionOptions] | None = None,
     ) -> None:
         """Initialize WinMLSession.
 
+        Three invocation styles:
+
+        1. **Fully-resolved (preferred for library callers):** pass
+           ``ep_device=<WinMLEPDevice>`` constructed via
+           :meth:`WinMLEPRegistry.auto_device` after :func:`resolve_device`.
+        2. **Ergonomic (CLI + tests):** pass ``device="npu"|"gpu"|"cpu"|"auto"``
+           and optionally ``ep="qnn"|...``; the session resolves an
+           ``ep_device`` internally via the singleton registry.
+        3. **Legacy:** omit the device for automatic selection, or supply the
+           device policy as the second positional string.
+
         Args:
-            onnx_path: Path to ONNX model
-            device: Target device policy ("auto", "npu", "gpu", "cpu").
-                Note: This specifies a policy (PREFER_NPU, PREFER_GPU, PREFER_CPU),
-                not a specific execution provider name. ORT selects the best
-                available provider for the requested policy.
-            ep_config
-                persist_jit: Persist JIT-compiled EPContext model
-                provider_options: EP-specific options dict
-            ep: Explicit EP short name (e.g., "migraphx", "nv_tensorrt_rtx").
-                When set, bypasses policy-based selection and uses
-                add_provider_for_devices to force the specific EP.
-            provider_options: Runtime EP provider options merged on top of any
-                ``ep_config.provider_options`` and forwarded to
-                ``add_provider_for_devices`` (e.g. QNN ``htp_performance_mode``).
-                Unlike ``ep_config``, this does not affect EPContext persistence —
-                it only tunes the runtime session.
-            session_options: Factory returning an ``ort.SessionOptions``.
-                Called once per ``_build_session_options`` invocation so each
-                ORT session gets a fresh, un-poisoned options object
-                (``add_provider_for_devices`` mutates the options and cannot
-                be replayed). Defaults to ``ort.SessionOptions``.
+            onnx_path: Path to ONNX model.
+            ep_device: Fully-resolved (source, device) pair, or a legacy positional
+                device policy string.
+            device: Device shortcut (npu/gpu/cpu/auto). Mutually resolved with ``ep``.
+            ep: Optional EP short name — e.g. ``"qnn"`` — to pin.
+            provider_options: EP-specific options dict, threaded into ep_config.
+            ep_config: Optional EP configuration (provider_options, etc.).
+            ep_monitor: Optional monitor. When passed, its session-config
+                entries are threaded into the initial
+                :func:`_build_session_options` call.
+            session_options: Callable that returns configured ORT SessionOptions.
+                A fresh object is requested for each ORT session construction.
         """
-        WinMLSession._init_winml_eps_once()
+        # Legacy positional device strings share the ergonomic resolution path.
+        # A resolved WinMLEPDevice remains the current positional API.
+        if isinstance(ep_device, str):
+            if device is not None:
+                raise TypeError(
+                    "WinMLSession received both a positional legacy device and device=."
+                )
+            device = ep_device
+            ep_device = None
+
+        # Ergonomic path: resolve ep_device from device/ep shortcuts.
+        # Tests expect ``WinMLSession(onnx_path, device="cpu")`` to defer
+        # InferenceSession creation to compile() (so ``ep_name`` returns
+        # None before compile). Mark this path as lazy so the eager
+        # runtime-workflow session-build at the bottom of __init__ is
+        # skipped, preserving the compile-first contract for the CLI
+        # ergonomic entry.
+        _ergonomic_lazy = False
+        if ep_device is None:
+            if ep is not None and device is None:
+                raise TypeError("WinMLSession requires device= when ep= is specified.")
+            from .ep_device import EPDeviceTarget, resolve_device
+            from .ep_registry import WinMLEPRegistry
+
+            # NO silent CPU fallback here. If the requested (ep, device)
+            # isn't available on this host, propagate the DeviceNotFound /
+            # WinMLEPNotDiscovered / WinMLEPRegistrationFailed as-is —
+            # silently rewriting a --device npu request to CPU would
+            # produce wrong-device inference with no signal.
+            target = resolve_device(
+                EPDeviceTarget(ep=ep or "auto", device=(device or "auto").lower())
+            )
+            ep_device = WinMLEPRegistry.instance().auto_device(target)
+            _ergonomic_lazy = True
+
+        if provider_options is not None:
+            # Fold provider_options into an EPConfig if the caller didn't
+            # already supply one.
+            if ep_config is None:
+                from ..compiler.configs import EPConfig as _EPConfig
+
+                ep_config = _EPConfig(
+                    provider=None,
+                    provider_options=dict(provider_options),
+                )
+            else:
+                merged = dict(ep_config.provider_options or {})
+                merged.update(provider_options)
+                ep_config = replace(ep_config, provider_options=merged)
 
         self._onnx_path = Path(onnx_path)
-        if not self._onnx_path.exists():
-            raise FileNotFoundError(f"ONNX model not found: {onnx_path}")
+        self._ep_device = ep_device
+        self._ep_config = ep_config
+        self._ep_monitor = ep_monitor
+        self._session_options_factory = session_options
 
-        # HF Pipeline may pass torch.device; coerce to string for downstream .lower() calls
-        self._device = str(device) if not isinstance(device, str) else device
-        self._ep = ep
-        self._persist_jit = ep_config.enable_ep_context if ep_config else False
-        self._embed_context = ep_config.embed_context if ep_config else False
-        self._provider_options = dict(ep_config.provider_options) if ep_config else {}
-        # Runtime provider options (e.g. from --ep-options) merge on top of and
-        # override any build-time options carried by ep_config.
-        if provider_options:
-            self._provider_options.update(provider_options)
-
-        self._session_options_factory: Callable[[], ort.SessionOptions] = (
-            session_options or ort.SessionOptions
+        initial_session_option_entries = (
+            dict(ep_monitor.get_session_options()) if ep_monitor is not None else {}
         )
 
-        # State management
-        self._state = SessionState.INITIALIZED
-        self._last_error: Exception | None = None
+        # Snapshots preserved across perf()/reset()/compile() entry/exit (see perf()).
+        self._provider_option_file_keys: frozenset[str] = frozenset(
+            ep_config.provider_option_file_keys if ep_config is not None else ()
+        )
+        self._provider_options: dict[str, str] = self._canonicalize_option_files(
+            _build_provider_options(ep_device, ep_config, ep_monitor),
+            self._provider_option_file_keys,
+        )
+        self._active_session_option_entries: dict[str, str] = dict(initial_session_option_entries)
+        self._markerless_epcontext_generations: dict[Path, Path | None] = {}
+        # Convenience: the canonical EP name from the chosen handle.
+        self._ep: str = ep_device.device.ep_name
 
-        # Single session (one session = one EP)
+        # Derived convenience attributes consumed by compile(), device property, etc.
+        self._device: str = ep_device.device.device_type.lower()
+        self._persist_jit: bool = ep_config.enable_ep_context if ep_config else False
+        self._embed_context: bool = ep_config.embed_context if ep_config else False
+
+        # _session is None until InferenceSession construction completes; __del__
+        # reads this attribute, so it must exist before any call that could raise.
         self._session: ort.InferenceSession | None = None
 
         # ONNX model ORT actually loads (set during compile()). May differ from
         # _onnx_path when an EPContext model is compiled or a cached one reused.
         self._running_model_path: Path | None = None
+
+        # State management
+        self._state = SessionState.INITIALIZED
+        self._last_error: Exception | None = None
 
         # Cached I/O metadata (lazy-loaded)
         self._io_config: dict | None = None
@@ -203,13 +496,40 @@ class WinMLSession:
         # Performance tracking (enabled via perf() context manager)
         self._perf_stats: PerfStats | None = None
 
-        logger.info("WinMLSession initialized: %s", onnx_path)
+        # Compile workflows defer session creation to compile(); runtime workflows
+        # create the session eagerly here.
+        if not self._persist_jit and not _ergonomic_lazy:
+            so = _build_session_options(
+                self._ep_device,
+                self._ep_config,
+                None,
+                self._session_options_factory,
+                session_option_entries=self._active_session_option_entries,
+                provider_options=self._provider_options,
+            )
+            with _suppress_native_output():
+                self._session = ort.InferenceSession(self._onnx_path, sess_options=so)
+            self._running_model_path = self._onnx_path
+            _dev = self._ep_device.device
+            logger.info(
+                "ort.InferenceSession: ep=%s device=%s hardware=%r providers=%s",
+                _dev.ep_name,
+                _dev.device_type,
+                _dev.hardware_name,
+                self._session.get_providers(),
+            )
 
     def compile(self) -> None:
         """Compile model for target device using ModelCompiler API.
 
         Only compiles once per session (idempotent).
         Device is immutable - set at __init__ time.
+
+        For compile workflows (ep_config.enable_ep_context=True) this method
+        runs ort.ModelCompiler.compile_to_file() to produce a .ctx.onnx, then
+        creates the runtime InferenceSession against that compiled artifact.
+        For runtime-only workflows (persist_jit=False) this is a no-op if the
+        session was already created eagerly in __init__.
         """
         # If already compiled, ignore (idempotent)
         if self._session is not None:
@@ -218,88 +538,628 @@ class WinMLSession:
 
         target_device = self._device
 
-        logger.debug("Compiling for device: %s", target_device)
+        logger.info("Compiling for device: %s", target_device)
 
-        # Determine model path (original or EPContext)
-        ctx_path = self._onnx_path.parent / f"{self._onnx_path.stem}_{target_device}_ctx.onnx"
-        model_path = self._onnx_path
-
-        # Check for existing fresh EPContext
-        if (
-            self._persist_jit
-            and ctx_path.exists()
-            and ctx_path.stat().st_mtime >= self._onnx_path.stat().st_mtime
-        ):
-            model_path = ctx_path
-            logger.info("Using cached EPContext: %s", ctx_path)
-
-        # Compile if needed (persist_jit=True and no cache)
-
-        if self._persist_jit and model_path == self._onnx_path:
-            # Skip ModelCompiler if input model is already compiled (EPContext)
-            if is_compiled_onnx(self._onnx_path):
-                logger.info("Model already compiled (EPContext), skipping ModelCompiler")
-            else:
-                try:
-                    sess_options, resolved_device, _ = self._build_session_options(target_device)
-                    model_compiler = ort.ModelCompiler(
-                        sess_options,
+        if not self._persist_jit:
+            try:
+                with _suppress_native_output():
+                    session = ort.InferenceSession(
                         str(self._onnx_path),
-                        embed_compiled_data_into_model=self._embed_context,
+                        sess_options=_build_session_options(
+                            self._ep_device,
+                            self._ep_config,
+                            None,
+                            self._session_options_factory,
+                            session_option_entries=self._active_session_option_entries,
+                            provider_options=self._provider_options,
+                        ),
                     )
-                    with capture_native_stderr(logging.INFO):
-                        model_compiler.compile_to_file(str(ctx_path))
+            except Exception as e:
+                self._state = SessionState.ERROR
+                self._last_error = e
+                raise CompilationError(
+                    message=f"Failed to compile for {target_device}",
+                    context={
+                        "device": target_device,
+                        "onnx_path": str(self._onnx_path),
+                        "error": str(e),
+                    },
+                    suggestion=self._get_compile_suggestion(target_device, e),
+                ) from e
 
-                    # Use compiled model if it was created
-                    if ctx_path.exists():
-                        model_path = ctx_path
-                        logger.info("Compiled to EPContext: %s", ctx_path)
+            self._session = session
+            self._running_model_path = self._onnx_path
+            self._state = SessionState.COMPILED
+            return
 
-                except Exception as e:
-                    # Some EPs don't support compilation - fall back to original
-                    logger.warning("ModelCompiler failed, using original: %s", e)
+        prepared_model = _PreparedEPContextModel(self._onnx_path)
+
+        # Native QNN SDK compiler writes progress to stdout/stderr;
+        # redirect to log file to keep the console clean.
+        compile_log = self._onnx_path.parent / "compile.log"
+
+        if is_compiled_onnx(self._onnx_path):
+            # Input model is already an EPContext — use it directly.
+            logger.info("Model already compiled (EPContext), skipping ModelCompiler")
+        else:
+            prepared_model = self._compile_epcontext_with_stable_source(compile_log)
+
+        model_path = prepared_model.path
 
         try:
-            # Create InferenceSession.
-            # EP is either configured via add_provider_for_devices (WinML EP
-            # registry, e.g. QNN) or left to ORT's device policy (fallback).
-            # Never pass providers= — WinML-registered EPs don't support it.
-            sess_options, resolved_device, _ = self._build_session_options(target_device)
-            with capture_native_stderr(logging.INFO):
-                session = ort.InferenceSession(str(model_path), sess_options=sess_options)
+            # Create the runtime InferenceSession against the (possibly compiled) model.
+            runtime_so = _build_session_options(
+                self._ep_device,
+                self._ep_config,
+                None,
+                self._session_options_factory,
+                session_option_entries=self._active_session_option_entries,
+                provider_options=self._provider_options,
+            )
+            with prepared_model, _suppress_native_output(compile_log):
+                session = ort.InferenceSession(str(model_path), sess_options=runtime_so)
 
-        except Exception as ep_err:
+            actual_providers = session.get_providers()
+            logger.info(
+                "Session created for device %s, providers: %s",
+                target_device,
+                actual_providers,
+            )
+
+        except Exception as e:
+            prepared_model.release()
+            if prepared_model.markerless and model_path != self._onnx_path:
+                self._discard_epcontext_generation(model_path)
             self._state = SessionState.ERROR
-            self._last_error = ep_err
+            self._last_error = e
             raise CompilationError(
                 message=f"Failed to compile for {target_device}",
                 context={
                     "device": target_device,
                     "onnx_path": str(self._onnx_path),
-                    "error": str(ep_err),
+                    "error": str(e),
                 },
-                suggestion=self._get_compile_suggestion(target_device, ep_err),
-            ) from ep_err
+                suggestion=self._get_compile_suggestion(target_device, e),
+            ) from e
 
-        # Log which providers were selected by ORT (based on policy)
-        actual_providers = session.get_providers()
-        logger.info(
-            "Session created with device %s, providers: %s",
-            target_device,
-            actual_providers,
-        )
-
-        # Store session. Record the model ORT actually loaded (original or
-        # EPContext) only after the session is successfully created, so a
-        # failed compile leaves running_model_path unset rather than stale.
         self._session = session
         self._running_model_path = model_path
         self._state = SessionState.COMPILED
+        if prepared_model.markerless and model_path != self._onnx_path:
+            self._markerless_epcontext_generations[model_path] = prepared_model.lock_path
 
-        # Resolve device label from the primary provider ORT actually selected
-        if self._device == "auto" and actual_providers:
-            self._device = resolved_device
-            logger.info("Auto-resolved device: %s", self._device)
+    def _compile_epcontext_with_stable_source(self, compile_log: Path) -> _PreparedEPContextModel:
+        """Prepare an EPContext whose marker matches a stable source snapshot."""
+        for _attempt in range(3):
+            try:
+                expected_identity = self._epcontext_cache_identity()
+            except (OSError, ValueError) as exc:
+                logger.warning(
+                    "Could not establish EPContext source identity; cache reuse disabled: %s",
+                    exc,
+                )
+                cache_path = self._epcontext_cache_path(None)
+                lock_path = cache_path.with_name(f"{cache_path.name}.lock")
+                lease = _EPContextCacheLease.acquire(lock_path)
+                assert lease is not None
+                try:
+                    prepared = self._prepare_epcontext_model(
+                        cache_path,
+                        compile_log,
+                        None,
+                    )
+                    if prepared is not None and prepared.path != self._onnx_path:
+                        prepared.lease = lease
+                        lease = None
+                    return prepared or _PreparedEPContextModel(self._onnx_path)
+                finally:
+                    if lease is not None:
+                        lease.release()
+
+            cache_path = self._epcontext_cache_path(expected_identity)
+            lock_path = cache_path.with_name(f"{cache_path.name}.lock")
+            lease = _EPContextCacheLease.acquire(lock_path)
+            assert lease is not None
+            try:
+                try:
+                    locked_identity = self._epcontext_cache_identity()
+                except (OSError, ValueError):
+                    continue
+                if locked_identity != expected_identity:
+                    continue
+                prepared = self._prepare_epcontext_model(
+                    cache_path,
+                    compile_log,
+                    locked_identity,
+                )
+                if prepared is None:
+                    continue
+                try:
+                    final_identity = self._epcontext_cache_identity()
+                except (OSError, ValueError):
+                    if prepared.markerless and prepared.path != self._onnx_path:
+                        self._discard_epcontext_generation(prepared.path)
+                    continue
+                if final_identity == locked_identity:
+                    if prepared.path != self._onnx_path:
+                        prepared.lease = lease
+                        lease = None
+                    return prepared
+                if prepared.markerless and prepared.path != self._onnx_path:
+                    self._discard_epcontext_generation(prepared.path)
+            finally:
+                if lease is not None:
+                    lease.release()
+
+        logger.warning("ONNX source changed during EPContext compilation; using original model")
+        return _PreparedEPContextModel(self._onnx_path)
+
+    def _prepare_epcontext_model(
+        self,
+        cache_path: Path,
+        compile_log: Path,
+        cache_identity: dict[str, object] | None,
+    ) -> _PreparedEPContextModel | None:
+        """Reuse or compile one EPContext while the caller holds its file lock."""
+        if cache_identity is not None:
+            cached_generation = self._epcontext_cached_generation(cache_path, cache_identity)
+            if cached_generation is not None:
+                logger.info("Using cached EPContext: %s", cached_generation)
+                return _PreparedEPContextModel(cached_generation)
+
+        generation_path = cache_path.with_name(
+            f"{cache_path.stem}_{uuid.uuid4().hex[:16]}{cache_path.suffix}"
+        )
+        try:
+            so = _build_session_options(
+                self._ep_device,
+                self._ep_config,
+                None,
+                self._session_options_factory,
+                session_option_entries=self._active_session_option_entries,
+                provider_options=self._provider_options,
+            )
+            model_compiler = ort.ModelCompiler(
+                so,
+                str(self._onnx_path),
+                embed_compiled_data_into_model=self._embed_context,
+            )
+            with _suppress_native_output(compile_log):
+                model_compiler.compile_to_file(str(generation_path))
+        except Exception as exc:
+            self._discard_epcontext_generation(generation_path)
+            logger.warning("ModelCompiler failed, using original: %s", exc)
+            return _PreparedEPContextModel(self._onnx_path)
+
+        if not generation_path.exists():
+            self._discard_epcontext_generation(generation_path)
+            return _PreparedEPContextModel(self._onnx_path)
+        markerless = cache_identity is None
+        if cache_identity is not None:
+            try:
+                current_identity = self._epcontext_cache_identity()
+            except (OSError, ValueError):
+                self._discard_epcontext_generation(generation_path)
+                return None
+            if current_identity != cache_identity:
+                self._discard_epcontext_generation(generation_path)
+                return None
+            try:
+                self._write_epcontext_cache_marker(
+                    cache_path,
+                    generation_path,
+                    cache_identity,
+                )
+            except (OSError, TypeError, ValueError) as exc:
+                logger.warning(
+                    "Compiled EPContext but could not write cache marker %s: %s",
+                    self._epcontext_cache_marker_path(cache_path),
+                    exc,
+                )
+                markerless = True
+            else:
+                self._prune_epcontext_cache(cache_path)
+        logger.info("Compiled to EPContext: %s", generation_path)
+        return _PreparedEPContextModel(generation_path, markerless=markerless)
+
+    @classmethod
+    def _discard_epcontext_generation(cls, generation_path: Path) -> None:
+        """Best-effort removal of an unpublished generation and its sidecars."""
+        paths: dict[Path, None] = {}
+        try:
+            for sidecar in cls._epcontext_external_sidecars(generation_path):
+                paths.setdefault(sidecar, None)
+        except (OSError, ValueError, DecodeError):
+            logger.debug(
+                "Could not parse EPContext sidecars for %s; using prefix cleanup fallback",
+                generation_path,
+                exc_info=True,
+            )
+        paths.setdefault(generation_path, None)
+        try:
+            for candidate in generation_path.parent.iterdir():
+                if candidate.name.startswith(generation_path.stem) and candidate.is_file():
+                    paths.setdefault(candidate, None)
+        except OSError:
+            logger.debug(
+                "Could not enumerate EPContext generation sidecars for %s",
+                generation_path,
+            )
+        for path in paths:
+            cls._unlink_generation_file(path)
+
+    def _prune_epcontext_cache(self, current_cache_path: Path) -> None:
+        """Bound successful EPContext cache entries for this source model and device."""
+        keep_count = max(1, _EPCONTEXT_CACHE_MAX_GENERATIONS)
+        marker_suffix = ".meta.json"
+        cache_name_suffix = "_ctx.onnx"
+        marker_name_suffix = f"{cache_name_suffix}{marker_suffix}"
+        marker_prefix = f"{self._onnx_path.stem}_{self._device}_"
+        current_marker = self._epcontext_cache_marker_path(current_cache_path).resolve(strict=False)
+        entries: list[tuple[bool, int, str, Path, Path, Path | None, bytes]] = []
+        for marker_path in current_cache_path.parent.iterdir():
+            try:
+                if not marker_path.is_file():
+                    continue
+                if not marker_path.name.startswith(marker_prefix) or not marker_path.name.endswith(
+                    marker_name_suffix
+                ):
+                    continue
+                cache_name = marker_path.name.removesuffix(marker_suffix)
+                if not cache_name.startswith(marker_prefix) or not cache_name.endswith(
+                    cache_name_suffix
+                ):
+                    continue
+                cache_path = marker_path.with_name(cache_name)
+                marker_contents = marker_path.read_bytes()
+                generation_path = self._epcontext_marker_generation(
+                    marker_path,
+                    marker_contents,
+                )
+                lock_path = cache_path.with_name(f"{cache_path.name}.lock")
+                marker_stat = marker_path.stat()
+            except OSError:
+                continue
+            is_current = marker_path.resolve(strict=False) == current_marker
+            entries.append(
+                (
+                    is_current,
+                    marker_stat.st_mtime_ns,
+                    marker_path.name,
+                    marker_path,
+                    lock_path,
+                    generation_path,
+                    marker_contents,
+                )
+            )
+        entries.sort(key=lambda entry: (entry[0], entry[1], entry[2]), reverse=True)
+        for (
+            is_current,
+            *_unused,
+            marker_path,
+            lock_path,
+            generation_path,
+            marker_contents,
+        ) in entries[keep_count:]:
+            if is_current:
+                continue
+            lease = _EPContextCacheLease.acquire(lock_path, blocking=False)
+            if lease is None:
+                continue
+            try:
+                try:
+                    locked_contents = marker_path.read_bytes()
+                except OSError:
+                    continue
+                locked_generation = self._epcontext_marker_generation(
+                    marker_path,
+                    locked_contents,
+                )
+                if locked_contents != marker_contents:
+                    if generation_path is not None and generation_path != locked_generation:
+                        self._discard_epcontext_generation(generation_path)
+                    continue
+                if locked_generation is not None:
+                    self._discard_epcontext_generation(locked_generation)
+                self._unlink_generation_file(marker_path)
+            finally:
+                lease.release()
+            self._unlink_generation_file(lock_path)
+
+    @staticmethod
+    def _epcontext_marker_generation(marker_path: Path, contents: bytes) -> Path | None:
+        """Return a marker's validated sibling generation path."""
+        try:
+            recorded = json.loads(contents)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return None
+        if not isinstance(recorded, dict):
+            return None
+        generation_name = recorded.get("generation")
+        if not isinstance(generation_name, str) or Path(generation_name).name != generation_name:
+            return None
+        return marker_path.parent / generation_name
+
+    def _cleanup_markerless_epcontext_generations(self) -> None:
+        """Best-effort cleanup for non-reusable EPContext generations owned by this session."""
+        remaining: dict[Path, Path | None] = {}
+        for generation_path, lock_path in self._markerless_epcontext_generations.items():
+            self._discard_epcontext_generation(generation_path)
+            if self._epcontext_generation_artifacts_exist(generation_path):
+                remaining[generation_path] = lock_path
+                continue
+            if lock_path is not None:
+                self._unlink_generation_file(lock_path)
+        self._markerless_epcontext_generations = remaining
+
+    @staticmethod
+    def _epcontext_generation_artifacts_exist(generation_path: Path) -> bool:
+        try:
+            return any(
+                candidate.name.startswith(generation_path.stem) and candidate.is_file()
+                for candidate in generation_path.parent.iterdir()
+            )
+        except OSError:
+            return generation_path.exists()
+
+    @staticmethod
+    def _unlink_generation_file(path: Path) -> None:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            logger.debug("Could not remove stale EPContext generation file %s", path)
+
+    @staticmethod
+    def _epcontext_cache_marker_path(ctx_path: Path) -> Path:
+        """Return the sidecar that records a direct-session cache identity."""
+        return ctx_path.with_name(f"{ctx_path.name}.meta.json")
+
+    def _epcontext_cache_path(self, identity: dict[str, object] | None) -> Path:
+        """Return an immutable identity path, or a unique non-cacheable path."""
+        if identity is None:
+            identity_token = uuid.uuid4().hex[:16]
+        else:
+            encoded_identity = json.dumps(identity, sort_keys=True, separators=(",", ":"))
+            identity_token = hashlib.sha256(encoded_identity.encode("utf-8")).hexdigest()[:16]
+        return self._onnx_path.with_name(
+            f"{self._onnx_path.stem}_{self._device}_{identity_token}_ctx.onnx"
+        )
+
+    def _epcontext_cache_identity(self) -> dict[str, object]:
+        """Return all inputs that affect a direct-session EPContext artifact."""
+        if self._session_options_factory is not None:
+            raise ValueError(
+                "custom SessionOptions factory cannot be represented in cache identity"
+            )
+        hardware = self._ep_device.device.ort_handle.device
+
+        def _optional_text(value: object) -> str | None:
+            return value if isinstance(value, str) and value else None
+
+        dll_fingerprint = (
+            None if self._ep_device.is_builtin else self._file_fingerprint(self._ep_device.dll_path)
+        )
+
+        return {
+            "schema_version": 1,
+            "source_model_hash": get_onnx_model_hash(self._onnx_path, strict=True),
+            "ep": self._ep_device.device.ep_name,
+            "ep_source": self._ep_device.source_tag,
+            "ep_version": self._ep_device.version,
+            "ep_dll": dll_fingerprint,
+            "device": self._device,
+            "hardware": {
+                "vendor_id": hardware.vendor_id,
+                "device_id": hardware.device_id,
+                "name": _optional_text(self._ep_device.device.hardware_name),
+                "driver_version": _optional_text(self._ep_device.device.driver_version),
+                "compiler_version": _optional_text(self._ep_device.device.compiler_version),
+            },
+            "provider_options": dict(sorted(self._provider_options.items())),
+            "provider_option_files": self._option_file_fingerprints(
+                self._provider_options,
+                self._provider_option_file_keys,
+            ),
+            "session_options": dict(sorted(self._active_session_option_entries.items())),
+            "session_option_files": {},
+            "embed_context": self._embed_context,
+            "ort_version": ort.__version__,
+        }
+
+    def _option_file_fingerprints(
+        self,
+        options: dict[str, str],
+        file_keys: frozenset[str],
+    ) -> dict[str, dict[str, object]]:
+        """Fingerprint provider options explicitly declared as file-backed."""
+        fingerprints = {}
+        for key in sorted(file_keys):
+            value = options.get(key)
+            if value is None:
+                continue
+            option_path = self._resolve_option_file(value)
+            if option_path is None:
+                raise ValueError(f"file-backed provider option {key!r} does not resolve to a file")
+            fingerprints[key] = self._file_fingerprint(option_path)
+        return fingerprints
+
+    def _canonicalize_option_files(
+        self,
+        options: dict[str, str],
+        file_keys: frozenset[str],
+    ) -> dict[str, str]:
+        """Resolve only provider options explicitly declared as file-backed."""
+        canonicalized = dict(options)
+        for key in file_keys:
+            value = options.get(key)
+            if value is None:
+                raise ValueError(f"file-backed provider option {key!r} is not configured")
+            option_path = self._resolve_option_file(value)
+            if option_path is None:
+                raise ValueError(f"file-backed provider option {key!r} does not resolve to a file")
+            canonicalized[key] = str(option_path)
+        return canonicalized
+
+    def _resolve_option_file(self, value: object) -> Path | None:
+        if not isinstance(value, str) or not value:
+            return None
+        try:
+            raw_path = Path(value).expanduser()
+        except (RuntimeError, ValueError):
+            return None
+        candidates: tuple[Path, ...] = (
+            (raw_path,) if raw_path.is_absolute() else (Path.cwd() / raw_path,)
+        )
+        seen: set[Path] = set()
+        for candidate in candidates:
+            try:
+                resolved = candidate.resolve(strict=True)
+            except (OSError, RuntimeError, ValueError):
+                continue
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            if resolved.is_file():
+                return resolved
+        return None
+
+    @staticmethod
+    def _file_fingerprint(path: Path) -> dict[str, object]:
+        """Return a strict metadata and content fingerprint for one file."""
+        resolved = path.resolve(strict=True)
+        stat = resolved.stat()
+        digest = hashlib.sha256()
+        with resolved.open("rb") as source_file:
+            for chunk in iter(lambda: source_file.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return {
+            "path": str(resolved),
+            "size": stat.st_size,
+            "mtime_ns": stat.st_mtime_ns,
+            "sha256": digest.hexdigest(),
+        }
+
+    @classmethod
+    def _epcontext_cached_generation(
+        cls,
+        cache_path: Path,
+        expected_identity: dict[str, object],
+    ) -> Path | None:
+        """Return the immutable generation selected by a valid identity marker."""
+        marker_path = cls._epcontext_cache_marker_path(cache_path)
+        try:
+            recorded = json.loads(marker_path.read_text(encoding="utf-8"))
+            if not isinstance(recorded, dict) or recorded.get("identity") != expected_identity:
+                return None
+            generation_name = recorded.get("generation")
+            if (
+                not isinstance(generation_name, str)
+                or Path(generation_name).name != generation_name
+            ):
+                return None
+            generation_path = cache_path.parent / generation_name
+            current_artifacts = cls._epcontext_artifact_fingerprint(generation_path)
+        except Exception:
+            return None
+        if recorded.get("artifacts") != current_artifacts:
+            return None
+        return generation_path
+
+    @staticmethod
+    def _epcontext_external_sidecars(ctx_path: Path) -> tuple[Path, ...]:
+        """Return validated external binaries referenced by an EPContext graph."""
+        from onnx import AttributeProto
+
+        from ..onnx import load_onnx
+
+        model = load_onnx(ctx_path, load_weights=False, validate=False)
+        source_root = ctx_path.parent.resolve()
+        sidecars: dict[Path, None] = {}
+        for node in model.graph.node:
+            if node.op_type != "EPContext":
+                continue
+            attrs = {attr.name: attr for attr in node.attribute}
+            embed_mode = attrs.get("embed_mode")
+            if embed_mode is None or (embed_mode.type == AttributeProto.INT and embed_mode.i != 0):
+                continue
+            if embed_mode.type != AttributeProto.INT:
+                raise ValueError("EPContext embed_mode must be an integer")
+            main_context = attrs.get("main_context")
+            cache_attr = attrs.get("ep_cache_context")
+            is_secondary = (
+                main_context is not None
+                and main_context.type == AttributeProto.INT
+                and main_context.i == 0
+            )
+            if cache_attr is None and is_secondary:
+                continue
+            if cache_attr is None or cache_attr.type != AttributeProto.STRING:
+                raise ValueError("External EPContext node must have a string ep_cache_context")
+            try:
+                cache_ref = cache_attr.s.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise ValueError("EPContext cache reference must be valid UTF-8") from exc
+            relative_ref = Path(cache_ref)
+            if not cache_ref or relative_ref.is_absolute() or relative_ref.drive:
+                raise ValueError(f"unsafe EPContext cache reference: {cache_ref!r}")
+            try:
+                sidecar = (source_root / relative_ref).resolve()
+                sidecar.relative_to(source_root)
+            except (OSError, ValueError) as exc:
+                raise ValueError(f"unsafe EPContext cache reference: {cache_ref!r}") from exc
+            if not sidecar.is_file() or sidecar.stat().st_size == 0:
+                raise FileNotFoundError(f"EPContext sidecar is unavailable: {sidecar}")
+            sidecars.setdefault(sidecar, None)
+        return tuple(sidecars)
+
+    @classmethod
+    def _epcontext_artifact_fingerprint(cls, ctx_path: Path) -> list[dict[str, object]]:
+        """Return metadata fingerprints for the graph and external binaries."""
+        source_root = ctx_path.parent.resolve()
+        paths = (ctx_path.resolve(), *cls._epcontext_external_sidecars(ctx_path))
+        fingerprints = []
+        for path in paths:
+            fingerprint = cls._file_fingerprint(path)
+            fingerprints.append(
+                {
+                    "path": path.relative_to(source_root).as_posix(),
+                    "size": fingerprint["size"],
+                    "mtime_ns": fingerprint["mtime_ns"],
+                    "sha256": fingerprint["sha256"],
+                }
+            )
+        return fingerprints
+
+    @classmethod
+    def _write_epcontext_cache_marker(
+        cls,
+        cache_path: Path,
+        generation_path: Path,
+        identity: dict[str, object],
+    ) -> None:
+        """Atomically publish the identity for a successfully compiled context."""
+        marker_path = cls._epcontext_cache_marker_path(cache_path)
+        marker_path.parent.mkdir(parents=True, exist_ok=True)
+        fd, temporary_name = tempfile.mkstemp(
+            prefix=f".{marker_path.name}.", suffix=".tmp", dir=marker_path.parent
+        )
+        temporary_path = Path(temporary_name)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as marker_file:
+                json.dump(
+                    {
+                        "identity": identity,
+                        "generation": generation_path.name,
+                        "artifacts": cls._epcontext_artifact_fingerprint(generation_path),
+                    },
+                    marker_file,
+                    indent=2,
+                    sort_keys=True,
+                )
+            temporary_path.replace(marker_path)
+        except Exception:
+            temporary_path.unlink(missing_ok=True)
+            raise
 
     def run(
         self,
@@ -355,9 +1215,7 @@ class WinMLSession:
             # Run inference (with optional perf tracking)
             output_names = [o.name for o in session.get_outputs()]
             if self._perf_stats:
-                outputs = self._perf_stats.record(
-                    lambda: session.run(output_names, ort_inputs)
-                )
+                outputs = self._perf_stats.record(lambda: session.run(output_names, ort_inputs))
             else:
                 outputs = session.run(output_names, ort_inputs)
 
@@ -381,7 +1239,14 @@ class WinMLSession:
 
         Clears compiled session and error state.
         """
+        self._reset_runtime_state(cleanup_markerless=True)
+
+    def _reset_runtime_state(self, *, cleanup_markerless: bool) -> None:
+        """Release the native session and optionally its private EPContext artifacts."""
         self._session = None
+        if cleanup_markerless:
+            self._cleanup_markerless_epcontext_generations()
+        self._running_model_path = None
         self._state = SessionState.INITIALIZED
         self._last_error = None
         logger.info("Session reset")
@@ -390,42 +1255,35 @@ class WinMLSession:
         """Clean up resources on deletion."""
         try:
             self._session = None
+            self._cleanup_markerless_epcontext_generations()
         except Exception:
             pass  # Suppress errors during interpreter shutdown
 
-    def _build_session_options(self, device: str) -> tuple[ort.SessionOptions, str, EPName]:
-        """Build ORT SessionOptions from the session_options factory and device.
+    @staticmethod
+    def _build_op_type_map(onnx_path: Path | None) -> dict[str, str]:
+        """Build a ``node.name -> node.op_type`` map from an ONNX file.
 
-        Returns a **fresh** SessionOptions produced by ``self._session_options_factory``
-        on every call so each ORT session gets an un-poisoned options object —
-        ``add_provider_for_devices`` cannot be replayed on the same instance.
+        Returns an empty dict on any failure (None path, missing file,
+        corrupt ONNX, missing ``onnx`` package). Op-tracing monitors that
+        receive an empty map fall through their fallback chain to
+        EP-authoritative or heuristic sources.
+
+        Used by :meth:`perf` to inject the map into op-tracing monitors
+        via :meth:`WinMLEPMonitor.set_onnx_op_types`.
         """
-        from ..sysinfo.device import resolve_device, resolve_eps
-        from ..utils.constants import DEVICE_TO_DEVICE_TYPE, normalize_ep_name
-        from ..winml import add_ep_for_device
+        if onnx_path is None:
+            return {}
+        try:
+            import onnx as _onnx
 
-        resolved_device, _ = resolve_device(device, ep=self._ep)
-        resolved_ep = normalize_ep_name(self._ep) if self._ep else resolve_eps(resolved_device)[0]
-        if resolved_ep is None:
-            raise ValueError(f"Unknown execution provider: {self._ep!r}")
-        device_type = DEVICE_TO_DEVICE_TYPE.get(resolved_device.upper())
-
-        opts = self._session_options_factory()
-        if add_ep_for_device(opts, resolved_ep, device_type, self._provider_options):
-            logger.info(
-                "Built SessionOptions with EP: %s (%s) device=%s -> %s provider_options=%s",
-                resolved_ep,
-                self._ep,
-                device,
-                resolved_device,
-                self._provider_options,
-            )
-            return opts, resolved_device, resolved_ep
-
-        # Defensive: should not be reachable unless the EP enumeration races.
-        raise DeviceNotAvailableError(
-            message=f"No available provider found for device '{device}' and EP '{self._ep}'"
-        )
+            model = _onnx.load(str(onnx_path), load_external_data=False)
+            return {n.name: n.op_type for n in model.graph.node if n.name and n.op_type}
+        except Exception as e:
+            # Defensive: any exception during ONNX load (missing file,
+            # corrupt protobuf, missing onnx package) returns empty.
+            # Logged at DEBUG; non-op-tracing path doesn't care.
+            logger.debug("Could not load ONNX op-type map from %s: %s", onnx_path, e)
+            return {}
 
     def _validate_inputs(self, inputs: dict[str, Any]) -> None:
         """Validate inputs against model expectations.
@@ -468,6 +1326,9 @@ class WinMLSession:
 
         ort_inputs = {}
         for name, value in inputs.items():
+            if name not in name_to_type:
+                continue
+
             # Convert to numpy
             if hasattr(value, "numpy"):  # torch.Tensor
                 arr = value.cpu().numpy()
@@ -499,14 +1360,6 @@ class WinMLSession:
 
         return "Check error details above"
 
-    def _get_install_suggestion(self, device: str) -> str:
-        """Get install suggestion for device policy."""
-        suggestions = {
-            "npu": "Install onnxruntime-windowsml",
-            "gpu": "Install onnxruntime-windowsml",
-        }
-        return suggestions.get(device.lower(), "")
-
     @property
     def state(self) -> SessionState:
         """Current session state."""
@@ -518,7 +1371,7 @@ class WinMLSession:
         return self._device
 
     @property
-    def ep_name(self) -> EPName | None:
+    def ep_name(self) -> str | None:
         """Primary EP ORT actually bound, or None before compile.
 
         Returns ``session.get_providers()[0]`` — the EP that owns node
@@ -528,7 +1381,7 @@ class WinMLSession:
         if self._session is None:
             return None
         providers = self._session.get_providers()
-        return cast("EPName", providers[0]) if providers else None
+        return providers[0] if providers else None
 
     @property
     def is_compiled(self) -> bool:
@@ -555,26 +1408,243 @@ class WinMLSession:
         return self._perf_stats
 
     @contextmanager
-    def perf(self, warmup: int = 0) -> Generator[PerfStats, None, None]:
-        """Context manager for scoped performance tracking.
+    def perf(
+        self,
+        warmup: int = 0,
+        monitor: WinMLEPMonitor | None = None,
+    ) -> Iterator[PerfContext]:
+        """Context manager for a scoped perf window.
+
+        Yields a :class:`PerfContext` whose ``stats`` property accumulates
+        timing from every :meth:`run` call made inside the ``with`` block.
+        The optional *monitor* is entered/exited around the body.
+
+        Session setup lifecycle
+        -----------------------
+        * If *monitor* contributes provider/session options that differ from
+          the active session, the compiled session is torn down first
+          (auto-reset with an INFO diagnostic) so the new options take effect.
+        * After the ``with`` block exits, any rebuilt session is restored from
+          the saved baseline provider/session-option snapshots.
+
+        Teardown ordering (C-2 invariant)
+        ----------------------------------
+        * For monitors with ``requires_session_teardown=True`` (e.g. QNNMonitor
+          which flushes CSV only on session destroy), :meth:`reset` fires
+          *before* ``monitor.__exit__`` so the flushed data is available inside
+          ``__exit__``.
+        * After ``monitor.__exit__``, the baseline is rebuilt from its saved
+          path and options without retaining a native session object.
 
         Args:
-            warmup: Number of initial samples to exclude from statistics.
+            warmup: Number of initial :meth:`run` calls to exclude from stats.
+            monitor: Optional EP-specific monitor.  ``NullEPMonitor`` is used
+                when *monitor* is ``None`` so callers need no null checks.
 
         Yields:
-            PerfStats instance that collects timing data within the context.
+            :class:`PerfContext` with ``stats`` (a :class:`PerfStats`) and
+            ``monitor`` (the effective :class:`WinMLEPMonitor`).
 
-        Example:
-            >>> with session.perf(warmup=10) as stats:
-            ...     for _ in range(110):
-            ...         session.run(inputs)
-            >>> print(f"P99: {stats.p99_ms:.2f} ms")  # Based on last 100 samples
+        Raises:
+            RuntimeError: If a perf window is already active (re-entry guard).
+            WinMLEPMonitorMismatch: If *monitor* targets a different EP than this session.
         """
-        self._perf_stats = PerfStats(warmup=warmup)
-        try:
-            yield self._perf_stats
-        finally:
+        from .monitor.ep_monitor import NullEPMonitor
+
+        if self._perf_stats is not None:
+            raise RuntimeError(
+                "WinMLSession.perf() is already active. Nested perf windows are not supported."
+            )
+
+        effective_monitor: WinMLEPMonitor = monitor if monitor is not None else NullEPMonitor()
+
+        if (
+            monitor is not None
+            and monitor.ep_name is not None
+            and expand_ep_name(monitor.ep_name) != self._ep
+        ):
+            raise WinMLEPMonitorMismatch(
+                f"Monitor ep_name={monitor.ep_name!r} expands to "
+                f"{expand_ep_name(monitor.ep_name)!r}, but session is bound "
+                f"to {self._ep!r}. Monitor and session must agree."
+            )
+
+        # Snapshot state for restore-on-exit.
+        saved_sess_entries = dict(self._active_session_option_entries)
+        saved_prov = dict(self._provider_options)
+        saved_ep = self._ep
+        had_baseline_session = self._session is not None
+        saved_state = self._state
+        saved_last_error = self._last_error
+        saved_running_model_path = self._running_model_path
+        active_model_path = (
+            saved_running_model_path
+            if had_baseline_session and saved_running_model_path is not None
+            else self._onnx_path
+        )
+
+        # Inject source ONNX context before rebuilding; the active runtime
+        # model path is injected after the monitored session is ready.
+        effective_monitor.set_onnx_model_path(self._onnx_path)
+        effective_monitor.set_onnx_op_types(self._build_op_type_map(self._onnx_path))
+
+        desired_sess_entries = _overlay_options(
+            saved_sess_entries,
+            dict(monitor.get_session_options()) if monitor is not None else None,
+        )
+        new_prov = self._canonicalize_option_files(
+            _overlay_options(
+                saved_prov,
+                dict(monitor.get_provider_options()) if monitor is not None else None,
+            ),
+            self._provider_option_file_keys,
+        )
+
+        # Rebuild InferenceSession only when monitor-contributed provider/session
+        # options differ from the current session's options (i.e. a new session
+        # is needed). Track whether we rebuilt so the teardown path knows
+        # whether to restore.
+        _session_rebuilt = (
+            new_prov != self._provider_options
+            or desired_sess_entries != self._active_session_option_entries
+            or self._session is None
+        )
+        if had_baseline_session and _session_rebuilt:
+            logger.info("auto-resetting compiled session to apply monitor session/provider options")
+            self._reset_runtime_state(cleanup_markerless=False)
+
+        stats = PerfStats(warmup=warmup)
+        restore_baseline = _session_rebuilt or getattr(
+            effective_monitor, "requires_session_teardown", False
+        )
+
+        def _restore_baseline() -> Exception | None:
+            """Reconstruct the pre-perf session from snapshots, never retained objects."""
+            self._session = None
+            self._active_session_option_entries = saved_sess_entries
+            self._provider_options = saved_prov
+            self._ep = saved_ep
             self._perf_stats = None
+
+            if not had_baseline_session:
+                self._state = saved_state
+                self._last_error = saved_last_error
+                self._running_model_path = saved_running_model_path
+                return None
+
+            try:
+                with _suppress_native_output():
+                    self._session = ort.InferenceSession(
+                        active_model_path,
+                        sess_options=_build_session_options(
+                            self._ep_device,
+                            self._ep_config,
+                            None,
+                            self._session_options_factory,
+                            session_option_entries=saved_sess_entries,
+                            provider_options=saved_prov,
+                        ),
+                    )
+            except Exception as error:
+                self._session = None
+                self._state = SessionState.ERROR
+                self._last_error = error
+                self._running_model_path = None
+                logger.exception("Restoring baseline InferenceSession failed")
+                return error
+
+            self._state = saved_state
+            self._last_error = saved_last_error
+            self._running_model_path = saved_running_model_path
+            return None
+
+        try:
+            if _session_rebuilt:
+                so = _build_session_options(
+                    self._ep_device,
+                    self._ep_config,
+                    None,
+                    self._session_options_factory,
+                    session_option_entries=desired_sess_entries,
+                    provider_options=new_prov,
+                )
+                with _suppress_native_output():
+                    self._session = ort.InferenceSession(active_model_path, sess_options=so)
+                self._provider_options = new_prov
+                self._active_session_option_entries = desired_sess_entries
+                self._running_model_path = active_model_path
+            effective_monitor.set_running_model_path(active_model_path)
+        except Exception:
+            _restore_baseline()
+            raise
+
+        self._perf_stats = stats
+
+        ctx = PerfContext(stats=stats, monitor=effective_monitor)
+
+        # Enter the monitor manually so we can control teardown order (C-2
+        # invariant: requires_session_teardown monitors need self.reset() to
+        # fire BEFORE monitor.__exit__).
+        try:
+            effective_monitor.__enter__()
+        except Exception:
+            # __enter__ failed — rebuild the baseline and do NOT call __exit__.
+            _restore_baseline()
+            raise
+
+        exc_info: tuple[type[BaseException] | None, BaseException | None, TracebackType | None] = (
+            None,
+            None,
+            None,
+        )
+        try:
+            yield ctx
+        except BaseException:
+            import sys
+
+            exc_info = sys.exc_info()
+        finally:
+            # Give sampling monitors the completed perf-window counts before
+            # any session teardown flushes and parses their artifacts.
+            monitor_error: Exception | None = None
+            try:
+                effective_monitor.set_perf_window(
+                    warmup=min(stats.warmup, stats.total_count),
+                    measured_iterations=stats.count,
+                )
+            except Exception as error:
+                logger.exception("Monitor set_perf_window failed")
+                if exc_info[1] is None:
+                    monitor_error = error
+
+            # C-2: for monitors that require session teardown, release the
+            # native session BEFORE monitor.__exit__ so flushed data is available.
+            if getattr(effective_monitor, "requires_session_teardown", False):
+                self._reset_runtime_state(cleanup_markerless=False)
+
+            # Call monitor.__exit__ — propagate exc_info so monitor sees the
+            # exception (exception transparency contract).
+            try:
+                effective_monitor.__exit__(*exc_info)
+            except Exception as error:
+                logger.exception("Monitor __exit__ failed")
+                if exc_info[1] is None and monitor_error is None:
+                    monitor_error = error
+
+            restore_error: Exception | None = None
+
+            if restore_baseline:
+                restore_error = _restore_baseline()
+            else:
+                self._perf_stats = None
+
+            # Re-raise any exception from the body.
+            if exc_info[1] is not None:
+                raise exc_info[1].with_traceback(exc_info[2])
+            if monitor_error is not None:
+                raise monitor_error
+            if restore_error is not None:
+                raise restore_error
 
     @property
     def io_config(self) -> dict:
@@ -648,7 +1718,7 @@ class WinMLSession:
         return value_ranges
 
     @staticmethod
-    def _get_precision(model_proto: onnx.ModelProto) -> str | None:
+    def _get_precision(model_proto: ModelProto) -> str | None:
         """Best-effort estimate of a model's numeric precision.
 
         Returns one of: ``"fp32"``, ``"fp16"``, ``"bf16"``, ``"int4"``,
@@ -749,7 +1819,7 @@ class WinMLSession:
         return None
 
     @staticmethod
-    def _dominant_float_bits(graph: onnx.GraphProto) -> int | None:
+    def _dominant_float_bits(graph: GraphProto) -> int | None:
         """Return 32 or 16 — whichever float dtype dominates initializer count.
 
         ``None`` if no float initializers are present.
@@ -771,24 +1841,19 @@ class WinMLSession:
 
     def is_compatible(
         self,
-        node: onnx.NodeProto,
-        graph: onnx.GraphProto | None = None,
-        *,
-        device: str | None = None,
+        node: NodeProto,
+        graph: GraphProto | None = None,
     ) -> bool:
         """Test if a single ONNX node is compatible with an EP.
 
         Wraps the node in a minimal graph, attempts to create an
-        InferenceSession with the target device's policy configuration.
-        Reuses the session's ``_build_session_options`` for consistency.
+        InferenceSession with the session's EPDeviceTarget binding.
 
         Args:
             node: ONNX node to test.
             graph: Optional parent graph for shape/type context.
                 When provided, extracts ValueInfoProto for accurate shapes.
                 Without it, uses dummy [1,1] float32 shapes (less accurate).
-            device: Target device for compatibility check (e.g., "npu", "gpu",
-                "cpu"). Defaults to the session's own device.
 
         Returns:
             True if the EP can handle this node, False otherwise.
@@ -799,8 +1864,6 @@ class WinMLSession:
         """
         from onnx import TensorProto, helper
 
-        target_device = device or self._device
-
         if graph is None:
             logger.warning(
                 "is_compatible() called without graph context for node '%s'. "
@@ -809,14 +1872,12 @@ class WinMLSession:
             )
 
         # 1. Resolve input/output ValueInfoProto
-        inputs: list[onnx.ValueInfoProto] = []
-        outputs: list[onnx.ValueInfoProto] = []
+        inputs: list[ValueInfoProto] = []
+        outputs: list[ValueInfoProto] = []
 
         if graph is not None:
             # Build lookup from parent graph
-            all_value_info: dict[str, onnx.ValueInfoProto] = {
-                vi.name: vi for vi in graph.value_info
-            }
+            all_value_info: dict[str, ValueInfoProto] = {vi.name: vi for vi in graph.value_info}
             for gi in graph.input:
                 all_value_info[gi.name] = gi
             for go in graph.output:
@@ -854,13 +1915,19 @@ class WinMLSession:
             test_model = helper.make_model(test_graph, opset_imports=[helper.make_opsetid("", 17)])
             test_model.ir_version = 8
 
-            # 3. Try creating session with same device policy
-            sess_options, _, _ = self._build_session_options(target_device)
-            sess_options.log_severity_level = 4  # Suppress ORT logs during probe
-            ort.InferenceSession(
-                test_model.SerializeToString(),
-                sess_options=sess_options,
+            # 3. Try creating session with same EPDeviceTarget binding
+            sess_options = _build_session_options(
+                self._ep_device,
+                self._ep_config,
+                None,
+                self._session_options_factory,
             )
+            sess_options.log_severity_level = 4  # Suppress ORT logs during probe
+            with _suppress_native_output():
+                ort.InferenceSession(
+                    test_model.SerializeToString(),
+                    sess_options=sess_options,
+                )
             return True
         except Exception:
             return False

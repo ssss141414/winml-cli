@@ -61,6 +61,7 @@ class TestExportCLIInterface:
         assert "-m" in result.output
         assert "--output" in result.output
         assert "-o" in result.output
+        assert "--batch-size" in result.output
 
         # Optional flags
         assert "--verbose" in result.output
@@ -202,6 +203,36 @@ class TestExportUsesExportOnnx:
         assert "export_config" in call_kwargs
         assert "model_id" in call_kwargs
         assert call_kwargs["model_id"] == "test-model"
+
+    def test_export_resolves_portable_compatibility_by_default(
+        self,
+        runner: CliRunner,
+        mock_export_onnx: MagicMock,
+        mock_load_hf_model: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Standalone exports should get the same portable policy as build configs."""
+        from winml.modelkit.commands.export import export
+        from winml.modelkit.export import WinMLExportConfig
+
+        with patch(
+            "winml.modelkit.export.resolve_export_config",
+            return_value=(WinMLExportConfig(), MagicMock()),
+        ):
+            result = runner.invoke(
+                export,
+                [
+                    "--model",
+                    "test-model",
+                    "--output",
+                    str(tmp_path / "model.onnx"),
+                ],
+                obj={"debug": False},
+            )
+
+        assert result.exit_code == 0, result.output
+        cfg = mock_export_onnx.call_args.kwargs["export_config"]
+        assert cfg.compatibility.transformers_attention == "eager"
 
     def test_export_passes_verbose_flag(
         self,
@@ -813,6 +844,58 @@ class TestExportAutoResolveInputTensors:
             call_kwargs = mock_export_onnx.call_args.kwargs
             config = call_kwargs["export_config"]
             assert config.input_tensors is not None
+
+    def test_export_applies_batch_size_to_resolution_and_export_config(
+        self,
+        runner: CliRunner,
+        mock_export_onnx: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """--batch-size controls both generated input shapes and export metadata."""
+        from winml.modelkit.commands.export import export
+        from winml.modelkit.export import InputTensorSpec, WinMLExportConfig
+        from winml.modelkit.loader import WinMLLoaderConfig
+
+        resolved_config = WinMLExportConfig(
+            batch_size=2,
+            input_tensors=[
+                InputTensorSpec(name="pixel_values", dtype="float32", shape=(2, 3, 224, 224)),
+            ],
+        )
+        loader_config = WinMLLoaderConfig(task="image-classification", model_type="resnet")
+
+        with (
+            patch("winml.modelkit.loader.load_hf_model") as mock_load,
+            patch(
+                "winml.modelkit.export.resolve_export_config",
+                return_value=(resolved_config, loader_config),
+            ) as mock_resolve,
+        ):
+            mock_load.return_value = (MagicMock(), None, "image-classification")
+            result = runner.invoke(
+                export,
+                [
+                    "--model",
+                    "microsoft/resnet-50",
+                    "--output",
+                    str(tmp_path / "model.onnx"),
+                    "--batch-size",
+                    "2",
+                ],
+                obj={"debug": False},
+            )
+
+        assert result.exit_code == 0, result.output
+        mock_resolve.assert_called_once_with(
+            model_id="microsoft/resnet-50",
+            task=None,
+            batch_size=2,
+            shape_config=None,
+        )
+        config = mock_export_onnx.call_args.kwargs["export_config"]
+        assert config.batch_size == 2
+        assert config.input_tensors is not None
+        assert config.input_tensors[0].shape == (2, 3, 224, 224)
 
 
 class TestExportTaskValidation:

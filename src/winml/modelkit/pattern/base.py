@@ -176,7 +176,13 @@ import onnx
 from onnx import ModelProto, numpy_helper
 from onnx.defs import OpSchema
 
-from ..onnx import ONNXDomain, SupportedONNXType, check_onnx_model, infer_onnx_shapes
+from ..onnx import (
+    ONNXDomain,
+    SupportedONNXType,
+    check_onnx_model,
+    infer_onnx_shapes,
+    infer_shapes,
+)
 from ..onnx.external_data import try_load_external_initializer_array
 from .match import InputInfo, PatternMatchResult, SkeletonMatchResult
 from .op_input_gen import InputShapeConstraint
@@ -925,7 +931,8 @@ class Pattern(ABC):
                 output_dtypes[output_idx]
             ).tensor_proto_type
 
-            output_tensor = helper.make_tensor_value_info(output_name, elem_type, None)
+            # Keep shape present for ONNX checker while leaving dimensions unknown.
+            output_tensor = helper.make_tensor_value_info(output_name, elem_type, [None])
             graph_outputs.append(output_tensor)
 
         # Create graph
@@ -951,12 +958,7 @@ class Pattern(ABC):
         # Set IR version to 11 for compatibility with older onnxruntime versions
         model.ir_version = 11
 
-        try:
-            model = infer_onnx_shapes(model)
-        except Exception:
-            pass
-
-        return model
+        return infer_shapes(model)
 
     def _infer_type_mapping(self, skeleton_match_result: "SkeletonMatchResult") -> dict[str, str]:
         """Infer type parameter mapping from actual tensor types in the model.
@@ -1219,6 +1221,8 @@ class PatternMatcher:
         onnx_model: ModelProto,
         raise_on_invalid_model: bool = True,
         model_path: str | Path | None = None,
+        *,
+        skip_shape_inference: bool = False,
     ) -> None:
         """Initialize the pattern matcher with an ONNX model.
 
@@ -1233,11 +1237,14 @@ class PatternMatcher:
                 proto will be lazily resolved from sidecar files (subject to the
                 size limits in the runtime-checker query helper) so that
                 value-based pattern constraints can still be evaluated.
+            skip_shape_inference: Use existing graph shape/type information
+                instead of rerunning inference. The caller must provide an
+                already-inferred model.
         """
         # Run shape inference to populate value_info with type information
         # This is critical for type inference and shape lookups
 
-        self.model = infer_onnx_shapes(onnx_model)
+        self.model = onnx_model if skip_shape_inference else infer_onnx_shapes(onnx_model)
         self.graph = self.model.graph
         self.model_path = Path(model_path) if model_path is not None else None
 
@@ -1967,6 +1974,17 @@ class PatternRewriter:
         ]
         used_graph_node_keys = set(graph_node_keys)
         generated_node_key_counter = 0
+        used_graph_tensor_names = {
+            name
+            for name in (
+                [value.name for value in graph.input]
+                + [value.name for value in graph.output]
+                + [value.name for value in graph.value_info]
+                + [initializer.name for initializer in graph.initializer]
+                + [name for node in graph.node for name in (*node.input, *node.output)]
+            )
+            if name
+        }
 
         def _allocate_graph_node_key(node: Any) -> str:
             """Allocate a non-conflicting stable key for inserted nodes."""
@@ -1989,6 +2007,20 @@ class PatternRewriter:
 
             used_graph_node_keys.add(key)
             return key
+
+        def _allocate_graph_tensor_name(name: str) -> str:
+            """Allocate a tensor name that does not collide with the parent graph."""
+            if name not in used_graph_tensor_names:
+                used_graph_tensor_names.add(name)
+                return name
+
+            suffix = 1
+            candidate = f"{name}__{suffix}"
+            while candidate in used_graph_tensor_names:
+                suffix += 1
+                candidate = f"{name}__{suffix}"
+            used_graph_tensor_names.add(candidate)
+            return candidate
 
         # Track which nodes have been deleted to avoid double deletion
         deleted_node_names: set[str] = set()
@@ -2097,6 +2129,34 @@ class PatternRewriter:
                     logger.debug("Skipping rewrite %s: %s", new_pattern_class.__name__, e)
                     continue
 
+                # Remap target-local tensors that collide with any existing graph
+                # tensor. Schema inputs and outputs are graph boundaries and must
+                # retain their original names.
+                boundary_names = {*input_names, *output_names}
+                local_tensor_names = dict.fromkeys(
+                    [initializer.name for initializer in new_subgraph_model.graph.initializer]
+                    + [
+                        name
+                        for node in new_subgraph_model.graph.node
+                        for name in (*node.output, *node.input)
+                    ]
+                )
+                tensor_name_mapping = {
+                    name: _allocate_graph_tensor_name(name)
+                    for name in local_tensor_names
+                    if name and name not in boundary_names
+                }
+                for node in new_subgraph_model.graph.node:
+                    for index, name in enumerate(node.input):
+                        node.input[index] = tensor_name_mapping.get(name, name)
+                    for index, name in enumerate(node.output):
+                        node.output[index] = tensor_name_mapping.get(name, name)
+                for initializer in new_subgraph_model.graph.initializer:
+                    initializer.name = tensor_name_mapping.get(
+                        initializer.name,
+                        initializer.name,
+                    )
+
                 # Find insertion point: position of last matched node after deletions
                 # Since original graph is topologically sorted,
                 # last matched node is after all input producers
@@ -2130,9 +2190,8 @@ class PatternRewriter:
 
                 # Append new initializers (constants) from the new subgraph
                 for initializer in new_subgraph_model.graph.initializer:
-                    # Check if initializer already exists (by name)
-                    existing_names = {init.name for init in graph.initializer}
-                    if initializer.name not in existing_names:
+                    # Schema-input constants already exist in the parent graph.
+                    if initializer.name not in boundary_names:
                         graph.initializer.append(initializer)
 
         # Add any missing opset imports to the model

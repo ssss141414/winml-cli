@@ -27,7 +27,9 @@ Note:
 
 from typing import Any
 
+from ._autoconfig import load_hf_config
 from .config import WinMLLoaderConfig, resolve_loader_config
+from .native import NativeDevice, NativeHFModel, load_native_hf_model, resolve_native_device
 from .onnx_hub import resolve_hf_onnx_path
 from .resolution import (
     TaskResolution,
@@ -52,18 +54,23 @@ __all__ = [
     "HF_TASK_DEFAULTS",
     "KNOWN_TASKS",
     "TASK_SYNONYM_EXTENSIONS",
+    "NativeDevice",
+    "NativeHFModel",
     "TaskResolution",
     "TaskSource",
     "WinMLLoaderConfig",
     "composite_pipeline_tasks",
     "get_supported_tasks",
     "get_task_abbrev",
+    "load_hf_config",
     "load_hf_model",
+    "load_native_hf_model",
     "normalize_task",
     "resolve_composite",
     "resolve_hf_model_class",
     "resolve_hf_onnx_path",
     "resolve_loader_config",
+    "resolve_native_device",
     "resolve_optimum_library",
     "resolve_task",
     "to_optimum_task",

@@ -13,11 +13,12 @@ Model-specific configurations should use presets which override these defaults.
 from __future__ import annotations
 
 import logging
-from dataclasses import InitVar, dataclass
+from dataclasses import InitVar, dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
 # InputTensorSpec and OutputTensorSpec live in modelkit.onnx.io (canonical home).
 from ..onnx import InputTensorSpec, OutputTensorSpec
+from .policy import ExportCompatibilityConfig
 
 
 if TYPE_CHECKING:
@@ -179,6 +180,9 @@ class WinMLExportConfig:
     verbose: bool = False
     dynamo: bool = False  # TorchScript exporter by default; True enables TorchDynamo
 
+    # Persisted export compatibility knobs (resolved from policy)
+    compatibility: ExportCompatibilityConfig = field(default_factory=ExportCompatibilityConfig)
+
     # Phase 2: Hierarchy Preservation Options
     enable_hierarchy_tags: bool = True  # Enable HTP hierarchy tagging by default
     clean_onnx: bool = False  # Remove hierarchy tags for deployment
@@ -213,6 +217,10 @@ class WinMLExportConfig:
         if output_names_ is not None and self.output_tensors is None:
             # Convert legacy output_names to output_tensors
             self.output_tensors = [OutputTensorSpec(name=name) for name in output_names_]
+
+        # Convert compatibility dicts (from deserialized data) to typed config
+        if isinstance(self.compatibility, dict):
+            self.compatibility = ExportCompatibilityConfig.from_dict(self.compatibility)
 
         if self.batch_size <= 0:
             raise ValueError(f"batch_size must be positive, got {self.batch_size}")
@@ -364,6 +372,9 @@ class WinMLExportConfig:
         if self.dynamic_axes:
             result["dynamic_axes"] = self.dynamic_axes
 
+        if self.compatibility:
+            result["compatibility"] = self.compatibility.to_dict()
+
         return result
 
     @classmethod
@@ -407,6 +418,11 @@ class WinMLExportConfig:
             enable_hierarchy_tags=data.get("enable_hierarchy_tags", True),
             clean_onnx=data.get("clean_onnx", False),
             hierarchy_tag_format=data.get("hierarchy_tag_format", "full"),
+            compatibility=(
+                ExportCompatibilityConfig.from_dict(data["compatibility"])
+                if "compatibility" in data
+                else ExportCompatibilityConfig()
+            ),
         )
 
 
@@ -493,6 +509,7 @@ def _resolve_export_config_from_specs(
         output_tensors = [OutputTensorSpec(name=name) for name in io_specs["output_names"]]
 
     return WinMLExportConfig(
+        batch_size=batch_size,
         input_tensors=input_tensors,
         output_tensors=output_tensors,
     )
@@ -504,6 +521,7 @@ def resolve_export_config(
     task: str | None = None,
     model_class: str | None = None,
     model_type: str | None = None,
+    batch_size: int = 1,
     shape_config: dict | None = None,
     library_name: str = "transformers",
     trust_remote_code: bool = False,
@@ -519,6 +537,7 @@ def resolve_export_config(
         task: Task name (auto-detected if None).
         model_class: Explicit model class name.
         model_type: Explicit model type override.
+        batch_size: Batch size for generated input specifications.
         shape_config: Shape overrides (sequence_length, height, width).
         library_name: Source library (default: "transformers").
         trust_remote_code: Whether to trust remote code.
@@ -546,7 +565,7 @@ def resolve_export_config(
         hf_config=hf_config,
         library_name=library_name,
         model_id=model_id,
-        batch_size=WinMLExportConfig().batch_size,
+        batch_size=batch_size,
         **(shape_config or {}),
     )
 

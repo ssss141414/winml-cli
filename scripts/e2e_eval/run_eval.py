@@ -6,9 +6,16 @@
 """E2E evaluation runner — unified, recipe-driven perf + accuracy.
 
 Batch-builds models and runs winml perf, then (when perf passes) winml eval,
-writing one unified eval_result.json per (model, task, precision). Builds prefer
-an authored recipe under ``examples/recipes/`` (``winml build -c`` for each
-precision variant), falling back to ``winml config`` for models without one.
+writing one unified eval_result.json per (model, task, precision). Recipes drive
+the build on every device (they carry the accuracy eval/dataset config), but
+quantized precision variants are NPU-only. On ``--device npu`` the runner builds
+every authored recipe variant under ``examples/recipes/`` (``winml build -c``),
+and a recipe-less NPU model falls back to ``winml config`` expanded into ``w8a8``
++ ``w8a16`` jobs (an explicit per-model precision overrides this). CPU/GPU build
+only the non-quantized recipe variants (e.g. ``fp16``), or a single ``winml
+config`` fallback when a model has no applicable recipe. EPs that are evaluated
+unquantized (see ``_should_skip_winml_quant``) follow the same non-quantized-only
+rule even on NPU.
 
 The runner records facts only (perf output + the winml-eval metrics/dataset).
 The per-model report HTML — perf latency and the "Model Accuracy Report" delta
@@ -37,9 +44,11 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import functools
 import hashlib
 import json
 import logging
+import math
 import os
 import platform
 import re
@@ -58,7 +67,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 from utils.dataset_config import get_dataset_config, register_from_registry
-from utils.recipes import RecipeVariant, discover_recipe_variants
+from utils.recipes import RecipeVariant, copy_recipe_target, discover_recipe_variants
 from utils.registry import (
     ModelEntry,
     filter_registry,
@@ -90,28 +99,81 @@ TIMEOUT_SKIP_LIST_PATH = Path(__file__).parent / "cache" / "timeout_skip_list.js
 _DEFAULT_SAMPLES = 1000
 _DEFAULT_PRECISION_NPU = "w8a16"
 
+# NPU fallback precisions used when a model has no authored recipe: the harness
+# expands into one winml-config job per NPU quantization scheme (w8a8 + w8a16).
+# An explicit per-model precision (``ModelEntry.precision``) overrides this. This
+# expansion is NPU-only; off-NPU devices never build quantized variants.
+_NPU_FALLBACK_PRECISIONS: tuple[str, ...] = ("w8a8", "w8a16")
+
 # EPs whose eval track keeps the model unquantized (the "fp" variant)
-# rather than running winml's QDQ pass on top.  This is an eval-setup
-# choice -- e.g. VitisAI / AMD Ryzen AI is benchmarked on the fp32/fp16
-# model -- not a claim about the EP's internal pipeline.  For these EPs
-# the harness passes ``--no-quant`` to both ``winml config`` and
-# ``winml build`` (see :func:`_run_build` and :func:`run_model`).
-#
-# Entries are canonical ``EPName`` values (the ``*ExecutionProvider`` form);
-# user-facing aliases like ``vitisai`` are normalised via
-# ``normalize_ep_name`` in :func:`_should_skip_winml_quant` so each EP only
-# needs to be listed once.
-_EPS_SKIP_WINML_QUANT = frozenset({"VitisAIExecutionProvider"})
+# rather than running winml's QDQ pass on top.  The EP list itself is the
+# product-level policy constant ``EPS_WITH_INTERNAL_QUANT`` -- e.g. VitisAI /
+# AMD Ryzen AI quantizes internally (XINT8) and aborts inside xir when handed a
+# winml-produced QDQ graph.  ``winml config`` / ``winml build`` already fall
+# back to the unquantized track for these EPs on their own; the harness still
+# passes ``--no-quant`` explicitly (see :func:`_run_build` and
+# :func:`run_model`) and additionally skips authored quantized recipe variants
+# (see :func:`_build_jobs`), which carry their own ``quant`` section that
+# ``--no-quant`` cannot override.
 
 
-def _should_skip_winml_quant(ep: str | None) -> bool:
-    """True if the eval harness should run this EP on the unquantized model."""
+@functools.cache
+def _deduce_ep_for_device(device: str) -> str | None:
+    """Canonical EP a concrete device resolves to on this host, or ``None``.
+
+    Mirrors what ``winml config`` / ``winml build`` do internally when ``--ep``
+    is omitted, so harness-side policy decisions see the same EP the product
+    will. ``"auto"`` is deliberately excluded: the product resolves it through
+    its own device detection, and the harness never forces a precision for it,
+    so the product's auto-precision policy already applies.
+    """
+    if not device or device.lower() == "auto":
+        return None
+    # Lazy import: keeps ``scripts/e2e_eval`` cheap to load (winml.modelkit
+    # transitively imports onnxruntime).
+    from winml.modelkit.session import default_ep_for_device
+
+    return default_ep_for_device(device.lower())
+
+
+def _effective_ep(ep: str | None, device: str | None) -> str | None:
+    """Canonical EP this run will actually target: explicit ``--ep``, else deduced."""
+    from winml.modelkit.utils.constants import normalize_ep_name
+
+    if ep:
+        return normalize_ep_name(ep)
+    return _deduce_ep_for_device(device or "auto")
+
+
+def _resolve_eval_target(ep: str | None, device: str | None) -> tuple[str, str]:
+    """Resolve possibly automatic CLI axes through the runtime target policy."""
+    from winml.modelkit.session import EPDeviceTarget, resolve_device
+
+    target = resolve_device(EPDeviceTarget(ep=ep or "auto", device=device or "auto"))
+    return target.ep, target.device
+
+
+def _validate_recipe_copy_target(ep: str | None, device: str | None) -> None:
+    """Require a concrete destination so copied recipes are discoverable."""
+    if not ep or ep.lower() == "auto" or not device or device.lower() == "auto":
+        raise ValueError("--copy-recipes-from requires explicit --ep and --device")
+
+
+def _should_skip_winml_quant(ep: str | None, device: str | None = None) -> bool:
+    """True if the eval harness should run this EP on the unquantized model.
+
+    ``ep`` is ``None`` whenever only ``--device`` was pinned, so the effective EP
+    has to be deduced from the device before deciding. Without that,
+    ``run_eval.py --device npu`` on an AMD-only host would keep expanding
+    quantized jobs and forcing ``--precision w8a16`` on VitisAI -- exactly the
+    QDQ graph this policy exists to avoid.
+    """
     # Lazy import: keeps ``scripts/e2e_eval`` cheap to load (winml.modelkit
     # transitively imports onnxruntime) and matches the existing in-function
     # import pattern used elsewhere in this script.
-    from winml.modelkit.utils.constants import normalize_ep_name
+    from winml.modelkit.utils.constants import EPS_WITH_INTERNAL_QUANT
 
-    return normalize_ep_name(ep) in _EPS_SKIP_WINML_QUANT
+    return _effective_ep(ep, device) in EPS_WITH_INTERNAL_QUANT
 
 
 def _resolve_precision(device: str, explicit: str | None, ep: str | None = None) -> str | None:
@@ -123,7 +185,8 @@ def _resolve_precision(device: str, explicit: str | None, ep: str | None = None)
     (NHWC layout transformer inserts Conv nodes that QNN GPU's GetCapability
     does not claim).
 
-    For EPs in :data:`_EPS_SKIP_WINML_QUANT` (e.g. VitisAI) the flag is forced
+    For EPs matched by :func:`_should_skip_winml_quant` (e.g. VitisAI) the flag
+    is forced
     off regardless of ``explicit``: the harness pairs these EPs with
     ``--no-quant`` at config/build time, so a non-empty ``--precision`` would
     produce a config that says "quantize to X" while the build says "skip
@@ -132,16 +195,57 @@ def _resolve_precision(device: str, explicit: str | None, ep: str | None = None)
 
     Otherwise an explicit per-model precision always takes precedence.
     """
-    if _should_skip_winml_quant(ep):
+    if _should_skip_winml_quant(ep, device):
         if explicit:
             safe_print(
-                f"  [precision] Ignoring explicit precision={explicit!r} for EP {ep!r}: "
-                "this EP is run on the unquantized variant (--no-quant)."
+                f"  [precision] Ignoring explicit precision={explicit!r} for EP "
+                f"{_effective_ep(ep, device)!r}: this EP is run on the unquantized "
+                "variant (--no-quant)."
             )
         return None
     if explicit:
         return explicit
     return _DEFAULT_PRECISION_NPU if device == "npu" else None
+
+
+# Quantization type -> bit width, used to rebuild the ``w{x}a{y}`` label from a
+# generated build config's quant section.
+_QUANT_TYPE_BITS = {"uint8": 8, "int8": 8, "uint16": 16, "int16": 16}
+
+
+def _precision_from_build_config(config_path: Path) -> str | None:
+    """Read back the precision ``winml config`` resolved into a build config.
+
+    The harness omits ``--precision`` whenever it has no explicit value (CPU/GPU,
+    ``--device auto``, or a recipe-less model with no pinned precision), and
+    ``winml config`` then resolves ``auto`` against the target device -- on NPU
+    that is w8a16, so the build is quantized even though the job declared no
+    precision. The config's ``quant`` section is the only faithful record of that
+    decision, and reporting it keeps a quantized build from being written out as
+    "no precision" -- which downstream reports read as "unquantized".
+
+    Only what the config states is returned: a config with no quant stage yields
+    None (nothing was requested, so nothing is claimed), as does a quant section
+    whose shape is unrecognised.
+    """
+    try:
+        cfg = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    quant = cfg.get("quant")
+    if not isinstance(quant, dict):
+        return None
+    mode = quant.get("mode")
+    if mode == "fp16":
+        return "fp16"
+    if mode == "rtn":
+        bits = quant.get("rtn_bits")
+        return f"int{bits}" if bits else None
+    weight_bits = _QUANT_TYPE_BITS.get(quant.get("weight_type"))
+    activation_bits = _QUANT_TYPE_BITS.get(quant.get("activation_type"))
+    if weight_bits and activation_bits:
+        return f"w{weight_bits}a{activation_bits}"
+    return None
 
 
 def _load_timeout_skip_set() -> set[tuple[str, str]]:
@@ -180,6 +284,17 @@ _NO_SPACE_PATTERNS = (
 
 _HF_CACHE = Path.home() / ".cache" / "huggingface"
 _WINML_CACHE = Path.home() / ".cache" / "winml"
+# VitisAI EP compilation cache. It lives outside the user profile -- AMD's
+# default is ``C:\temp\<user>\vaip\.cache`` -- so clearing the HF/WinML caches
+# alone leaves compiled NPU artifacts behind. AMD documents that these
+# directories must not be reused across VitisAI EP or NPU driver versions, and a
+# stale entry also lets a run load a previously compiled model instead of
+# exercising the compile path under test.
+_VAIP_CACHE = (
+    Path("C:/temp") / os.environ["USERNAME"] / "vaip" / ".cache"
+    if platform.system() == "Windows" and os.environ.get("USERNAME")
+    else None
+)
 _TEMP_DIR = Path(os.environ.get("TEMP", os.environ.get("TMP", tempfile.gettempdir())))
 _TEMP_PREFIXES = ("winmlcli_", "winmlcli_compat_")
 
@@ -191,9 +306,9 @@ def _is_no_space_error(proc: dict) -> bool:
 
 
 def _clear_disk_caches() -> None:
-    """Delete HuggingFace, WinML cache directories and leaked temp files."""
-    for cache_dir in (_HF_CACHE, _WINML_CACHE):
-        if cache_dir.exists():
+    """Delete HuggingFace, WinML, VitisAI EP caches and leaked temp files."""
+    for cache_dir in (_HF_CACHE, _WINML_CACHE, _VAIP_CACHE):
+        if cache_dir is not None and cache_dir.exists():
             safe_print(f"  [cleanup] Removing cache: {cache_dir}")
             try:
                 shutil.rmtree(cache_dir)
@@ -376,30 +491,44 @@ def _kill_process_tree(pid: int) -> None:
     """
     try:
         import psutil
+    except ImportError:
+        psutil = None
 
-        parent = psutil.Process(pid)
-        children = parent.children(recursive=True)
-        for child in children:
-            with contextlib.suppress(psutil.NoSuchProcess):
-                child.kill()
-        with contextlib.suppress(psutil.NoSuchProcess):
-            parent.kill()
-        # Wait briefly for processes to terminate
-        psutil.wait_procs([*children, parent], timeout=5)
-    except (ImportError, psutil.NoSuchProcess):
-        # Fallback: taskkill on Windows, killpg on Unix
-        if platform.system() == "Windows":
-            subprocess.run(  # noqa: S603
-                ["taskkill", "/F", "/T", "/PID", str(pid)],  # noqa: S607
-                capture_output=True,
-            )
+    if psutil is not None:
+        try:
+            parent = psutil.Process(pid)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            return
+        try:
+            children = parent.children(recursive=True)
+        except psutil.Error:
+            # The process tree may change between Process() and children().
+            # Fall through to the platform tree-kill as a best effort.
+            pass
         else:
-            import signal
+            for child in children:
+                with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
+                    child.kill()
+            with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
+                parent.kill()
+            # Wait briefly for processes to terminate
+            with contextlib.suppress(psutil.Error):
+                psutil.wait_procs([*children, parent], timeout=5)
+            return
 
-            try:
-                os.killpg(os.getpgid(pid), signal.SIGKILL)
-            except ProcessLookupError:
-                pass  # Process already exited; nothing to kill
+    # Fallback: taskkill on Windows, killpg on Unix
+    if platform.system() == "Windows":
+        subprocess.run(  # noqa: S603
+            ["taskkill", "/F", "/T", "/PID", str(pid)],  # noqa: S607
+            capture_output=True,
+        )
+    else:
+        import signal
+
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGKILL)
+        except ProcessLookupError:
+            pass  # Process already exited; nothing to kill
 
 
 def _run_subprocess(args: list[str], timeout: int) -> dict:
@@ -553,6 +682,14 @@ def _run_build(
     via ``-o`` (preserving the intermediate export/optimized/quantized ONNX) and
     skips compile (``--no-compile``) — no execution provider is required.
     Otherwise the build populates the global cache (``--use-cache``).
+
+    ``precision`` is passed to both ``winml config`` and ``winml build``: since
+    we always pass ``--device``, ``winml build -c`` re-resolves quant from
+    device+precision and overwrites what the config baked in, so omitting it
+    would let the build revert to its auto default (npu → w8a16). The result
+    dict reports that effective precision back under ``precision`` (read from
+    the generated config when the caller passed none), so the recorded
+    eval_result never claims "no precision" for a quantized build.
     """
     composite_onnx = getattr(entry, "composite_onnx", None)
     if isinstance(composite_onnx, dict) and composite_onnx:
@@ -560,6 +697,9 @@ def _run_build(
             "success": True,
             "onnx_paths": dict(composite_onnx),
             "stage": "prebuilt",
+            # Nothing is built here: the registry supplies pre-exported ONNX, so
+            # the caller's resolved precision is all that describes them.
+            "precision": precision,
             "proc": {
                 "exit_code": 0,
                 "stdout": "Using pre-built composite ONNX paths from registry.",
@@ -601,12 +741,12 @@ def _run_build(
         config_args += ["--task", entry.task]
     if ep:
         config_args += ["--ep", ep]
-    # EPs in _EPS_SKIP_WINML_QUANT are evaluated on the unquantized variant.
+    # Internal-quant EPs are evaluated on the unquantized variant.
     # Pass --no-quant to winml config so the generated build_config.json is
     # written with quant=None up-front; otherwise on NPU the config command
     # would still apply its default precision (w8a16) and we'd be relying on
     # --no-quant at build time alone to override it.
-    if _should_skip_winml_quant(ep):
+    if _should_skip_winml_quant(ep, device):
         config_args += ["--no-quant"]
 
     config_proc = _run_subprocess(config_args, timeout)
@@ -623,6 +763,11 @@ def _run_build(
     sub_configs = sorted(config_path.parent.glob(f"{config_path.stem}_*.json"))
     if not sub_configs:
         sub_configs = [config_path]
+
+    # Precision actually applied: the flag when the caller pinned one, else what
+    # `winml config` resolved from `auto`. Reported back so the result records
+    # the built precision rather than "none" (see _precision_from_build_config).
+    effective_precision = precision or _precision_from_build_config(sub_configs[0])
 
     # Step 2: build each sub-config
     # Map component label → ONNX path. Single model uses "" as label.
@@ -652,12 +797,15 @@ def _run_build(
         else:
             build_args += ["--use-cache"]
         build_args += ["--device", device]
+        # See docstring: forward precision so the build doesn't revert to auto.
+        if precision:
+            build_args += ["--precision", precision]
         if ep:
             build_args += ["--ep", ep]
         # Mirror the --no-quant passed to winml config above so the build
         # stage also skips QDQ regardless of what the config carries (defence
-        # in depth; see _EPS_SKIP_WINML_QUANT for the rationale).
-        if _should_skip_winml_quant(ep):
+        # in depth; see _should_skip_winml_quant for the rationale).
+        if _should_skip_winml_quant(ep, device):
             build_args += ["--no-quant"]
 
         build_proc = _run_subprocess(build_args, timeout)
@@ -669,6 +817,7 @@ def _run_build(
                 "onnx_paths": onnx_paths,
                 "stage": stage,
                 "proc": build_proc,
+                "precision": effective_precision,
             }
 
         if build_only:
@@ -690,6 +839,7 @@ def _run_build(
         "onnx_paths": onnx_paths,
         "stage": "complete",
         "proc": last_proc,
+        "precision": effective_precision,
     }
 
 
@@ -797,6 +947,7 @@ def _run_recipe_build(
                 "stage": stage,
                 "proc": proc,
                 "meta_config": meta_config,
+                "precision": variant.precision,
             }
 
         # Locate the cached artifact from the build output (same mechanism as
@@ -817,6 +968,7 @@ def _run_recipe_build(
                 "stage": stage,
                 "proc": proc,
                 "meta_config": meta_config,
+                "precision": variant.precision,
             }
         onnx_paths[role or ""] = str(onnx)
 
@@ -826,6 +978,7 @@ def _run_recipe_build(
         "stage": "complete",
         "proc": last_proc,
         "meta_config": meta_config,
+        "precision": variant.precision,
     }
 
 
@@ -1586,6 +1739,92 @@ def _run_build_only(entries: list[ModelEntry], args: argparse.Namespace) -> None
 # ---------------------------------------------------------------------------
 
 
+def _is_finite_number(value: object) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+    )
+
+
+def _validate_single_perf_result(result: dict, context: str = "result") -> str | None:
+    if result.get("schema_version") != 2:
+        return f"{context}.schema_version must be 2"
+
+    for field in ("benchmark_info", "model_info", "latency_ms", "throughput"):
+        if not isinstance(result.get(field), dict):
+            return f"{context}.{field} must be a JSON object"
+
+    latency = result["latency_ms"]
+    for field in ("mean", "min", "max", "p50", "p90", "p95", "p99", "std", "warmup_mean"):
+        if not _is_finite_number(latency.get(field)):
+            return f"{context}.latency_ms.{field} must be a finite number"
+
+    throughput = result["throughput"]
+    for field in ("samples_per_sec", "batches_per_sec"):
+        if not _is_finite_number(throughput.get(field)):
+            return f"{context}.throughput.{field} must be a finite number"
+
+    raw_samples = result.get("raw_samples_ms")
+    if not isinstance(raw_samples, list) or not raw_samples:
+        return f"{context}.raw_samples_ms must be a non-empty array"
+    if any(not _is_finite_number(sample) for sample in raw_samples):
+        return f"{context}.raw_samples_ms must contain only finite numbers"
+    return None
+
+
+def _validate_perf_result(result: dict) -> str | None:
+    """Validate the single-model or native composite ``winml perf`` schema."""
+    if "components" not in result and "component_count" not in result:
+        return _validate_single_perf_result(result)
+
+    components = result.get("components")
+    component_count = result.get("component_count")
+    if not isinstance(component_count, int) or isinstance(component_count, bool):
+        return "result.component_count must be an integer"
+    if not isinstance(components, dict) or not components:
+        return "result.components must be a non-empty JSON object"
+    if component_count != len(components):
+        return "result.component_count must match the number of components"
+
+    for name, component in components.items():
+        if not isinstance(name, str) or not name:
+            return "result.components keys must be non-empty strings"
+        if not isinstance(component, dict):
+            return f"result.components.{name} must be a JSON object"
+        error = _validate_single_perf_result(component, f"result.components.{name}")
+        if error is not None:
+            return error
+    return None
+
+
+def _reject_perf_result(proc: dict, message: str) -> None:
+    proc["stderr"] = "\n".join(filter(None, [proc.get("stderr", ""), message]))
+    proc["exit_code"] = 1
+    proc["error_summary"] = "invalid structured perf output"
+
+
+def _load_perf_result(proc: dict, output_path: Path) -> dict | None:
+    """Load the structured JSON report written by ``winml perf --output``."""
+    if proc["exit_code"] != 0:
+        return None
+
+    try:
+        result = json.loads(output_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        _reject_perf_result(proc, f"Failed to load structured winml perf output: {e}")
+        return None
+
+    if not isinstance(result, dict):
+        _reject_perf_result(proc, "Invalid structured winml perf output: root must be an object")
+        return None
+    validation_error = _validate_perf_result(result)
+    if validation_error is not None:
+        _reject_perf_result(proc, f"Invalid structured winml perf output: {validation_error}")
+        return None
+    return result
+
+
 def _resolve_op_tracing(
     cli_op_tracing: str | None, entry: ModelEntry, ep: str | None, device: str
 ) -> str | None:
@@ -1630,16 +1869,18 @@ def _extract_op_trace_path(text: str) -> Path | None:
     return Path(joined[: end + len(".json")])
 
 
-def _copy_op_trace(proc: dict, model_dir: Path, label: str = "") -> None:
+def _copy_op_trace(proc: dict, output_path: Path, model_dir: Path, label: str = "") -> None:
     """Copy the op-trace JSON produced by winml perf into ``model_dir``.
 
-    The source path is parsed from the perf stdout/stderr. The destination is
-    ``op_trace.json`` (suffixed with the sub-model label for composite models).
-    A missing line is ignored — op-tracing may be unsupported for a given
-    EP/device/level and winml perf then emits nothing.
+    The current perf contract writes the trace beside ``--output`` with an
+    ``_op_trace`` suffix. Console parsing remains as a fallback for older perf
+    versions. The destination is ``op_trace.json`` (suffixed with the sub-model
+    label for composite models).
     """
-    src = _extract_op_trace_path(proc.get("stdout", "") + "\n" + proc.get("stderr", ""))
-    if src is None or not src.exists():
+    src = output_path.with_name(f"{output_path.stem}_op_trace{output_path.suffix}")
+    if not src.exists():
+        src = _extract_op_trace_path(proc.get("stdout", "") + "\n" + proc.get("stderr", ""))
+    if src is None or not src.is_file():
         return
     dest_name = f"op_trace_{label}.json" if label else "op_trace.json"
     dest = model_dir / dest_name
@@ -1648,6 +1889,28 @@ def _copy_op_trace(proc: dict, model_dir: Path, label: str = "") -> None:
         safe_print(f"    op-tracing: {dest}")
     except OSError as e:
         safe_print(f"    op-tracing: failed to copy {src} -> {dest}: {e}")
+
+
+def _run_structured_perf(
+    args: list[str],
+    timeout: int,
+    model_dir: Path | None,
+    copy_op_trace: bool = False,
+    op_trace_label: str = "",
+) -> dict:
+    """Run perf and load its JSON report without parsing console output."""
+    if model_dir is not None:
+        model_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="winml-perf-", dir=model_dir) as temp_dir:
+        output_path = Path(temp_dir) / "result.json"
+        proc = _run_subprocess(
+            [*args, "--output", str(output_path), "--overwrite"],
+            timeout,
+        )
+        proc["result"] = _load_perf_result(proc, output_path)
+        if copy_op_trace and model_dir is not None:
+            _copy_op_trace(proc, output_path, model_dir, op_trace_label)
+        return proc
 
 
 def run_model(
@@ -1662,13 +1925,13 @@ def run_model(
     """Execute winml perf for one or more ONNX models. Returns merged result dict.
 
     When onnx_paths is provided, benchmarks each pre-built ONNX directly.
-    Single model is the {"": path} case. Results are merged (worst exit
-    code, concatenated stdout/stderr, summed elapsed).
+    Single model is the {"": path} case. Results are merged (structured perf
+    reports under ``result``, worst exit code, concatenated stdout/stderr,
+    summed elapsed). Multi-model structured results are keyed by sub-model label.
 
     When op_tracing is set, ``--op-tracing <level>`` is passed to winml perf. The
-    op-trace path is parsed from perf's output and the file is copied into
-    ``model_dir`` as ``op_trace.json`` (suffixed with the sub-model label for
-    composite models).
+    op-trace JSON beside the structured perf output is copied into ``model_dir``
+    as ``op_trace.json`` (suffixed with the sub-model label for composite models).
     """
     trace = bool(op_tracing) and model_dir is not None
 
@@ -1691,21 +1954,21 @@ def run_model(
             args += ["--task", entry.task]
         if ep:
             args += ["--ep", ep]
-        if _should_skip_winml_quant(ep):
+        if _should_skip_winml_quant(ep, device):
             args += ["--no-quant"]
         args += ["--iterations", "10", "--warmup", "2"]
         if trace:
             args += ["--op-tracing", op_tracing]
         args += entry.perf_args
 
-        proc = _run_subprocess(args, timeout)
-        if trace:
-            _copy_op_trace(proc, model_dir)
+        proc = _run_structured_perf(args, timeout, model_dir, copy_op_trace=trace)
         proc["device"] = device
         proc["timestamp"] = _utc_now()
         proc["error_summary"] = (
             ""
             if proc["exit_code"] == 0
+            else proc.get("error_summary", "")
+            if proc.get("error_summary")
             else f"timeout ({timeout}s)"
             if proc["timeout"]
             else f"exit code {proc['exit_code']}"
@@ -1719,6 +1982,7 @@ def run_model(
     worst_exit = 0
     any_timeout = False
     commands: list[str] = []
+    perf_results: dict[str, dict] = {}
 
     for label, path in onnx_paths.items():
         if label:
@@ -1732,9 +1996,16 @@ def run_model(
             args += ["--op-tracing", op_tracing]
         args += entry.perf_args
 
-        proc = _run_subprocess(args, timeout)
-        if trace:
-            _copy_op_trace(proc, model_dir, label)
+        proc = _run_structured_perf(
+            args,
+            timeout,
+            model_dir,
+            copy_op_trace=trace,
+            op_trace_label=label,
+        )
+        perf_result = proc["result"]
+        if perf_result is not None:
+            perf_results[label] = perf_result
         if label:
             all_stdout.append(f"=== {label} ===\n{proc['stdout']}")
             all_stderr.append(f"=== {label} ===\n{proc['stderr']}")
@@ -1757,6 +2028,11 @@ def run_model(
         "command": commands[0] if len(commands) == 1 else " | ".join(commands),
         "device": device,
         "timestamp": _utc_now(),
+        "result": (
+            perf_results[""]
+            if len(onnx_paths) == 1 and "" in perf_results
+            else perf_results or None
+        ),
         "error_summary": (
             ""
             if worst_exit == 0
@@ -2301,34 +2577,107 @@ class EvalJob:
 
     ``variant`` is the authored recipe variant to build (one per precision),
     or ``None`` for the fallback path that generates the build config with
-    ``winml config``. Each job produces one ``eval_result.json``.
+    ``winml config``. ``fallback_precision`` pins the precision of a fallback
+    (``variant is None``) job — used on NPU to expand a recipe-less model into
+    one job per NPU quantization scheme (see :data:`_NPU_FALLBACK_PRECISIONS`);
+    it stays ``None`` for the single default-precision fallback. Each job
+    produces one ``eval_result.json``.
     """
 
     entry: ModelEntry
     variant: RecipeVariant | None
+    fallback_precision: str | None = None
 
     @property
     def precision(self) -> str | None:
-        """Recipe precision (e.g. ``fp16``/``w8a16``), or None for the fallback."""
-        return self.variant.precision if self.variant is not None else None
+        """Recipe precision, else pinned fallback, else the per-model precision.
+
+        Falling back to ``entry.precision`` keeps the result-dir slug, display
+        label, and recorded precision in sync with what ``_build_for_job``
+        actually builds (it uses ``fallback_precision or entry.precision``) for
+        a recipe-less job that carries an explicit per-model precision.
+        """
+        if self.variant is not None:
+            return self.variant.precision
+        return self.fallback_precision or self.entry.precision
 
 
-def _build_jobs(entries: list[ModelEntry], recipes_dir: Path | None) -> list[EvalJob]:
-    """Expand entries into jobs, one per recipe precision variant.
+def _is_quantized_precision(precision: str) -> bool:
+    """True if a recipe precision implies quantization.
 
-    For each entry, if ``recipes_dir`` is set and the model has recipe variants
-    for its task, emit one job per variant (precision); otherwise emit a single
-    fallback job (``variant=None``) that builds via ``winml config``.
+    Off-NPU devices skip quantized recipe variants (see :func:`_build_jobs`).
+    Delegates to winml's precision policy so the classification never drifts
+    from the CLI (``fp16`` -> False, ``w8a16``/``w8a8`` -> True).
     """
+    from winml.modelkit.config.precision import is_quantized_precision
+
+    return is_quantized_precision(precision)
+
+
+def _build_jobs(
+    entries: list[ModelEntry], recipes_dir: Path | None, device: str, ep: str | None = None
+) -> list[EvalJob]:
+    """Expand entries into jobs. Recipes apply on every device; quant is NPU-only.
+
+    Automatic EP/device axes are resolved through the runtime target policy
+    before recipe lookup so target-specific directories always use concrete
+    ``<ep>/<device>`` names.
+
+    Recipes carry the accuracy eval/dataset config, so they are consulted
+    regardless of device -- but quantized recipe variants (``w8a16``/``w8a8``)
+    only make sense on an NPU running a quantizing EP. For each entry:
+
+    * NPU + recipe variants on disk → one job per variant (``fp16`` + any
+      quantized).
+    * NPU + no recipe + no per-model precision → one fallback job per NPU
+      quantization scheme (:data:`_NPU_FALLBACK_PRECISIONS`, i.e. ``w8a8`` +
+      ``w8a16``). Skipped for skip-quant EPs (VitisAI), which build a single
+      unquantized fallback -- otherwise both precisions collapse onto the same
+      unquantized artifact (``_resolve_precision`` forces the flag off).
+    * NPU + no recipe + explicit per-model precision → a single fallback job
+      honoring that precision (``winml config``).
+    * non-NPU (or a skip-quant EP) + non-quantized recipe variants → one job
+      per such variant (quantized variants are dropped).
+    * non-NPU (or a skip-quant EP) with no applicable recipe variant → a single
+      ``winml config`` fallback job (``variant=None``).
+    """
+    resolved_ep, resolved_device = _resolve_eval_target(ep, device)
+    npu = resolved_device == "npu"
+    # Skip-quant EPs (VitisAI) are evaluated on the unquantized model: the
+    # fallback path forces --no-quant, so the NPU multi-precision expansion
+    # would produce duplicate artifacts under distinct precision slugs, and an
+    # authored quantized recipe would hand the EP a QDQ graph its compiler is
+    # not expected to consume.  Both are suppressed.
+    skip_quant = _should_skip_winml_quant(resolved_ep, resolved_device)
+    expand_npu_quant = npu and not skip_quant
     jobs: list[EvalJob] = []
     for entry in entries:
         variants = (
-            discover_recipe_variants(recipes_dir, entry.hf_id, entry.task)
+            discover_recipe_variants(
+                recipes_dir,
+                entry.hf_id,
+                entry.task,
+                ep=resolved_ep,
+                device=resolved_device,
+            )
             if recipes_dir is not None
             else []
         )
+        if not npu or skip_quant:
+            # Off-NPU and skip-quant EPs still use recipes for their eval
+            # config, but drop quantized variants -- quantization here is only
+            # for NPU EPs that consume a winml-quantized model.
+            variants = [v for v in variants if not _is_quantized_precision(v.precision)]
         if variants:
             jobs.extend(EvalJob(entry, variant) for variant in variants)
+        elif expand_npu_quant and entry.precision is None:
+            # NPU without a recipe: build both NPU quantization precisions. An
+            # explicit per-model precision (e.g. fp16) skips this and is honored
+            # by the single-fallback branch below via _resolve_precision.
+            jobs.extend(
+                EvalJob(entry, None, fallback_precision=prec)
+                for prec in _NPU_FALLBACK_PRECISIONS
+            )
         else:
             jobs.append(EvalJob(entry, None))
     return jobs
@@ -2352,10 +2701,13 @@ def _build_for_job(
         recipe_meta = build_result.get("meta_config")
         trust = _needs_trust_remote_code(recipe_meta)
     else:
+        # Fallback: winml config. A fallback job may pin an NPU precision
+        # (w8a8/w8a16); otherwise the per-model precision (if any) applies.
+        explicit_precision = job.fallback_precision or job.entry.precision
         build_result = _run_build(
             job.entry,
             args.device,
-            _resolve_precision(args.device, job.entry.precision, ep=args.ep),
+            _resolve_precision(args.device, explicit_precision, ep=args.ep),
             args.timeout,
             model_dir,
             ep=args.ep,
@@ -2363,6 +2715,32 @@ def _build_for_job(
         recipe_meta = None
         trust = False
     return build_result, recipe_meta, trust
+
+
+def _merge_backfill_result(
+    existing: dict, accuracy_result: dict | None, precision: str | None
+) -> dict:
+    """Splice a freshly-run accuracy into an existing result.
+
+    The recorded perf section is preserved verbatim (it already ran and passed);
+    ``accuracy_result`` has the same shape :func:`build_eval_result` stores, so
+    it is spliced in directly.
+
+    ``precision`` is what the backfill's rebuild reported and always replaces the
+    recorded value -- including when it is None (a skip-quant/unquantized build),
+    since leaving the old value would let a stale declared precision keep
+    claiming an artifact that was never built.
+    """
+    result = dict(existing)
+    result["accuracy"] = accuracy_result
+    if precision is None:
+        result.pop("precision", None)
+    else:
+        result["precision"] = precision
+    eval_types = result.get("eval_types_run") or []
+    if "accuracy" not in eval_types:
+        result["eval_types_run"] = [*eval_types, "accuracy"]
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -2395,6 +2773,16 @@ def parse_args() -> argparse.Namespace:
         "--no-recipes",
         action="store_true",
         help="Ignore examples/recipes and build every model via winml config.",
+    )
+    parser.add_argument(
+        "--copy-recipes-from",
+        nargs=2,
+        metavar=("EP", "DEVICE"),
+        help=(
+            "Before evaluation, copy missing recipe configs from each model's "
+            "<EP>/<DEVICE> directory into the target --ep/--device directory. "
+            "Existing target configs are never overwritten."
+        ),
     )
     parser.add_argument(
         "--eval-type",
@@ -2739,10 +3127,37 @@ def main() -> None:
         args.continue_run = True
         retry_types = {t.upper() for t in args.retry_failed} if args.retry_failed else set()
 
-    # Expand entries into per-precision recipe jobs; models without a recipe
-    # for their task fall back to a single winml-config build (variant=None).
+    # Expand entries into jobs. Recipes drive the build on every device (they
+    # carry the eval/dataset config), but quantized variants are NPU-only: on
+    # NPU a model builds one job per recipe precision variant (or, recipe-less
+    # with no per-model precision, one per NPU quantization scheme -- w8a8 +
+    # w8a16); off-NPU builds only the non-quantized recipe variants, else a
+    # single winml-config fallback (variant=None).
     recipes_dir = None if args.no_recipes else args.recipes_dir
-    jobs = _build_jobs(entries, recipes_dir)
+    if args.copy_recipes_from:
+        if recipes_dir is None:
+            parser_error = "--copy-recipes-from cannot be used with --no-recipes"
+            raise ValueError(parser_error)
+        _validate_recipe_copy_target(args.ep, args.device)
+        source_ep, source_device = args.copy_recipes_from
+        copied_count = 0
+        for entry in entries:
+            copied = copy_recipe_target(
+                recipes_dir,
+                entry.hf_id,
+                source_ep,
+                source_device,
+                args.ep,
+                args.device,
+            )
+            copied_count += len(copied)
+            for path in copied:
+                safe_print(f"  [recipe] Copied: {path}")
+        safe_print(
+            f"Recipe copy: {copied_count} configs from {source_ep}/{source_device} "
+            f"to {args.ep}/{args.device}"
+        )
+    jobs = _build_jobs(entries, recipes_dir, args.device, ep=args.ep)
     total_jobs = len(jobs)
 
     safe_print(f"E2E Evaluation: {len(entries)} models -> {total_jobs} jobs -> {output_dir}")
@@ -2751,8 +3166,16 @@ def main() -> None:
         f"Device: {args.device} | EP: {ep_label} | Timeout: {args.timeout}s | Eval: {args.eval_type}"
     )
     safe_print(f"Disk free: {_get_disk_free_gb():.1f} GB")
-    if recipes_dir is not None:
-        safe_print(f"Recipes: {recipes_dir}  (winml config fallback when a model has none)")
+    if recipes_dir is not None and args.device == "npu":
+        safe_print(
+            f"Recipes: {recipes_dir}  "
+            f"(NPU; winml config {'+'.join(_NPU_FALLBACK_PRECISIONS)} fallback when a model has none)"
+        )
+    elif recipes_dir is not None:
+        safe_print(
+            f"Recipes: {recipes_dir}  "
+            f"(non-NPU '{args.device}'; non-quantized variants only, winml config fallback)"
+        )
     else:
         safe_print("Recipes: disabled (winml config for all builds)")
     if args.clean_cache:
@@ -2780,6 +3203,9 @@ def main() -> None:
     for i, job in enumerate(jobs, 1):
         entry = job.entry
         precision = job.precision
+        # What the build reports it applied; stays None until the build phase runs
+        # (and for a job whose build applies no precision at all).
+        recorded_precision: str | None = None
         prec_tag = f" [{precision}]" if precision else ""
         base_label = f"{entry.hf_id} / {entry.task}" if entry.task else entry.hf_id
         label = f"{base_label}{prec_tag}"
@@ -2858,6 +3284,12 @@ def main() -> None:
             # for this precision, else the winml-config fallback. Both return
             # {success, onnx_paths, stage, proc}; build is shared by perf + eval.
             build_result, recipe_meta, trust = _build_for_job(job, args, model_dir)
+
+            # Record what the build applied, never what the job declared: a
+            # fallback job with no pinned precision still builds at the device
+            # default (NPU -> w8a16), while a skip-quant EP drops even an explicit
+            # per-model precision. The declared value stays in the dir slug/label.
+            recorded_precision = build_result.get("precision")
 
             onnx_paths = build_result["onnx_paths"] if build_result["success"] else {}
             onnx_size = _compute_onnx_size(onnx_paths)
@@ -2942,14 +3374,7 @@ def main() -> None:
             break
 
         if backfill_existing is not None:
-            # Merge the freshly-run accuracy into the existing result, preserving
-            # its recorded perf verbatim. accuracy_result has the same shape
-            # build_eval_result would store, so it's spliced in directly.
-            result = dict(backfill_existing)
-            result["accuracy"] = accuracy_result
-            etr = result.get("eval_types_run") or []
-            if "accuracy" not in etr:
-                result["eval_types_run"] = [*etr, "accuracy"]
+            result = _merge_backfill_result(backfill_existing, accuracy_result, recorded_precision)
         else:
             result = build_eval_result(
                 entry,
@@ -2960,7 +3385,7 @@ def main() -> None:
                 ep=args.ep,
                 onnx_size_bytes=onnx_size,
                 sanitize_fn=None if args.raw_output else _sanitize_output,
-                precision=precision,
+                precision=recorded_precision,
             )
         results.append(result)
 

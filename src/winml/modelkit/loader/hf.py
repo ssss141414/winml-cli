@@ -145,6 +145,8 @@ def load_hf_model(
     trust_remote_code: bool = False,
     hf_config: PretrainedConfig | None = None,
     model_type: str | None = None,
+    *,
+    torch_dtype: Any | None = None,
 ) -> tuple[nn.Module, PretrainedConfig, str]:
     """Load, detect task, and prepare HuggingFace model.
 
@@ -172,6 +174,8 @@ def load_hf_model(
         hf_config: Optional pre-loaded HF config. When supplied, the
             ``AutoConfig.from_pretrained`` round-trip is skipped — same dedup
             pattern as ``resolve_loader_config(hf_config=...)`` from PR #719.
+        torch_dtype: Optional dtype policy forwarded to ``from_pretrained``.
+            Pass ``"auto"`` to preserve the checkpoint's stored dtype.
 
     Returns:
         Tuple of (model, hf_config, task)
@@ -214,7 +218,10 @@ def load_hf_model(
 
     # [1] Load HF Config
     if hf_config is None:
-        hf_config = AutoConfig.from_pretrained(
+        from ._autoconfig import load_hf_config
+
+        hf_config = load_hf_config(
+            AutoConfig,
             model_name_or_path,
             trust_remote_code=trust_remote_code,
         )
@@ -260,17 +267,28 @@ def load_hf_model(
             raise ValueError(
                 f"Cannot resolve task/model for {model_name_or_path}. Original error: {e}"
             ) from e
-
     # [4] Model Instantiation
     logger.debug("Loading model with class: %s", resolved_class.__name__)
     # resolved_class is a dynamically-resolved model class (transformers, timm,
     # diffusers, ...); from_pretrained is a duck-typed boundary across these libs,
     # so go through an Any-typed alias rather than a static attribute access.
     loader_cls: Any = resolved_class
-    model = loader_cls.from_pretrained(
-        model_name_or_path,
-        trust_remote_code=trust_remote_code,
-    )
+    model_config = hf_config
+    expected_config_class = getattr(loader_cls, "config_class", None)
+    if isinstance(expected_config_class, type) and not isinstance(hf_config, expected_config_class):
+        matching_subconfigs = [
+            value for value in vars(hf_config).values() if isinstance(value, expected_config_class)
+        ]
+        if len(matching_subconfigs) == 1:
+            model_config = cast("PretrainedConfig", matching_subconfigs[0])
+
+    load_kwargs: dict[str, Any] = {
+        "trust_remote_code": trust_remote_code,
+        "config": model_config,
+    }
+    if torch_dtype is not None:
+        load_kwargs["torch_dtype"] = torch_dtype
+    model = loader_cls.from_pretrained(model_name_or_path, **load_kwargs)
 
     # [5] Export Preparation
     model.eval()

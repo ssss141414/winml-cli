@@ -331,18 +331,20 @@ def resolve_composite_components(
     """
     from transformers import AutoConfig
 
+    from ._autoconfig import load_hf_config
+
     if task is not None:
         resolved_type = model_type
         if resolved_type is None and hf_model is not None:
-            resolved_type = AutoConfig.from_pretrained(
-                hf_model, trust_remote_code=trust_remote_code
+            resolved_type = load_hf_config(
+                AutoConfig, hf_model, trust_remote_code=trust_remote_code
             ).model_type
         if resolved_type is None:
             return None
         return resolve_composite(resolved_type, task)
 
     if hf_model is not None:
-        config = AutoConfig.from_pretrained(hf_model, trust_remote_code=trust_remote_code)
+        config = load_hf_config(AutoConfig, hf_model, trust_remote_code=trust_remote_code)
     elif model_type is not None:
         config = AutoConfig.for_model(model_type)
     else:
@@ -389,9 +391,11 @@ def resolve_composite_load_task(
     """
     from transformers import AutoConfig
 
+    from ._autoconfig import load_hf_config
+
     if hf_model is None:
         return None
-    config = AutoConfig.from_pretrained(hf_model, trust_remote_code=trust_remote_code)
+    config = load_hf_config(AutoConfig, hf_model, trust_remote_code=trust_remote_code)
     if resolve_task(config).composite is None:
         return None
     model_type = getattr(config, "model_type", None)
@@ -408,6 +412,24 @@ def resolve_composite_load_task(
 # Optimum-canonical generation task that detect-path seq2seq models surface;
 # bridged to the model_type's composite. Universal taxonomy, not a model name.
 _SEQ2SEQ_GENERATION_TASK = "text2text-generation"
+
+
+def _surface_detected_task(config: PretrainedConfig, opt_task: str, model_id: str | None) -> str:
+    """Return the surfaced WinML task for a detected Optimum task.
+
+    Keeps export/model-class resolution on Optimum's canonical task while allowing
+    user-facing task semantics to upgrade when authoritative metadata carries a
+    narrower meaning.
+    """
+    surfaced = _resolve_task_modality(config, opt_task)
+    if surfaced != "text-classification" or not model_id:
+        return surfaced
+
+    from ..utils.hub_utils import get_pipeline_tag
+
+    if normalize_task(get_pipeline_tag(model_id) or "") == "reranking":
+        return "reranking"
+    return surfaced
 
 
 def _infer_task_from_architecture(config: PretrainedConfig) -> str:
@@ -487,6 +509,13 @@ def resolve_task(
     (e.g. ``qwen3_transformer_only``) without mutating the loaded HF config; when
     ``None`` the architecture's native ``config.model_type`` is used.
     """
+    if getattr(config, "_winml_generic_fallback", False) is True:
+        raise ValueError(
+            "Cannot resolve a concrete architecture from a model_type-less generic config. "
+            "Provide a config or model ID whose architecture can be inferred; explicit task "
+            "or model_type overrides are not enough."
+        )
+
     from optimum.exporters.tasks import TasksManager
 
     model_type = model_type_override or getattr(config, "model_type", None)
@@ -507,8 +536,9 @@ def resolve_task(
             # pixel_values arch). (b) is a no-op for non-feature-extraction tasks, so (a)
             # is preserved. Consistent with the inferred branch below and USER_TASK —
             # adding --model-class must not collapse the modality.
-            opt_task = normalize_task(task)
-            surfaced = _resolve_task_modality(config, opt_task)
+            surfaced_task = normalize_task(task)
+            opt_task = to_optimum_task(surfaced_task)
+            surfaced = _resolve_task_modality(config, surfaced_task)
         else:
             # Task inferred from the architecture: surface it modality-aware, consistent
             # with the detection path (Stage 3), so e.g. a ViT backbone is
@@ -545,6 +575,7 @@ def resolve_task(
     if task is not None:
         original = task
         normalized = normalize_task(task)
+        optimum_task = to_optimum_task(normalized)
         # Exact-key composite lookup on the ORIGINAL user string: registration keys are
         # `summarization` / `table-question-answering`, never the normalized
         # `text2text-generation`. So `--task summarization` tags the composite while
@@ -557,7 +588,9 @@ def resolve_task(
             ) or _get_custom_model_class(model_type_norm, normalized)
         if resolved is None:
             try:
-                resolved = TasksManager.get_model_class_for_task(normalized, framework="pt")
+                resolved = TasksManager.get_model_class_for_task(
+                    optimum_task, framework="pt", model_type=model_type or None
+                )
             except KeyError as e:
                 if composite is not None:
                     # Pure composite (e.g. table-question-answering): no single model class
@@ -570,8 +603,13 @@ def resolve_task(
                         f"Task '{normalized}' not supported by TasksManager. "
                         f"Check optimum documentation for supported tasks."
                     ) from e
+        surfaced_task = normalized if original == "text-ranking" else original
         return TaskResolution(
-            original, to_optimum_task(original), resolved, TaskSource.USER_TASK, composite
+            surfaced_task,
+            to_optimum_task(surfaced_task),
+            resolved,
+            TaskSource.USER_TASK,
+            composite,
         )
 
     # --- Stage 1: detection -----------------------------------------------
@@ -644,12 +682,14 @@ def resolve_task(
         resolved = _get_custom_model_class(model_type_norm, opt_task)
         if resolved is None:
             try:
-                resolved = TasksManager.get_model_class_for_task(opt_task, framework="pt")
+                resolved = TasksManager.get_model_class_for_task(
+                    opt_task, framework="pt", model_type=model_type or None
+                )
             except Exception:
                 resolved = _resolve_model_class_from_config(config)  # arch fallback
 
     # --- Stage 3: modality upgrade (surfaced task only) -------------------
-    surfaced = _resolve_task_modality(config, opt_task)
+    surfaced = _surface_detected_task(config, opt_task, model_id)
 
     # --- Stage 4: composite tag (detection path) --------------------------
     composite = _composite_components_for_task(model_type, opt_task) if model_type else None

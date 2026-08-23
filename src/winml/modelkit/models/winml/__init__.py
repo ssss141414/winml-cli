@@ -34,6 +34,7 @@ logger = logging.getLogger(__name__)
 TASK_TO_WINML_CLASS: dict[str, str] = {
     # Implemented
     "image-classification": "WinMLModelForImageClassification",
+    "reranking": "WinMLModelForSequenceClassification",
     "text-classification": "WinMLModelForSequenceClassification",
     "sequence-classification": "WinMLModelForSequenceClassification",
     "next-sentence-prediction": "WinMLModelForSequenceClassification",
@@ -198,6 +199,7 @@ from .genai_bundle import (
     register_genai_bundle,
     resolve_genai_bundle,
 )
+from .genai_causal_lm import HFCausalLM, WinMLGenaiCausalLM
 from .image_classification import WinMLModelForImageClassification
 from .image_segmentation import (
     ImageSegmentationOutput,
@@ -223,11 +225,13 @@ __all__ = [
     "GenaiCompanionSpec",
     "GenaiTarget",
     "GenaiTransformerSpec",
+    "HFCausalLM",
     "ImageSegmentationOutput",
     "WinMLCache",
     "WinMLCompositeModel",
     "WinMLDecoderOnlyModel",
     "WinMLEncoderDecoderModel",
+    "WinMLGenaiCausalLM",
     "WinMLModelForDepthEstimation",
     "WinMLModelForFeatureExtraction",
     "WinMLModelForGenericTask",

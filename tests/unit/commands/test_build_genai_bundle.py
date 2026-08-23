@@ -32,46 +32,31 @@ import click
 import pytest
 from click.testing import CliRunner
 
+from winml.modelkit.session import EPDeviceTarget
 
-_DEVICE_TO_EPS = {
-    "npu": ["QNNExecutionProvider"],
-    "gpu": ["DmlExecutionProvider"],
-    "cpu": ["CPUExecutionProvider"],
-}
 
-_BUNDLE_TARGET = "winml.modelkit.models.winml.build_genai_bundle"
+_BUNDLE_TARGET = "winml.modelkit.commands.build._build_genai_bundle_isolated"
 _RUN_SINGLE_TARGET = "winml.modelkit.commands.build._run_single_build"
 _COMPOSITE_TARGET = "winml.modelkit.loader.resolution.resolve_composite_components"
 _GENERATE_TARGET = "winml.modelkit.config.generate_build_config"
-
-
-def _fake_resolve_check_device_ep(*, device: str = "auto", ep: str | None = None):
-    resolved = device.lower() if device != "auto" else "npu"
-    eps = _DEVICE_TO_EPS.get(resolved, ["CPUExecutionProvider"])
-    return resolved, ["npu", "gpu", "cpu"], eps
+# The genai fast path resolves ``--device auto`` via ``session.resolve_device``
+# (an ``EPDeviceTarget -> EPDeviceTarget`` deducer).
+_RESOLVE_DEVICE_TARGET = "winml.modelkit.session.resolve_device"
+_NPU_TARGET = EPDeviceTarget(ep="QNNExecutionProvider", device="npu")
+_CPU_TARGET = EPDeviceTarget(ep="CPUExecutionProvider", device="cpu")
 
 
 @pytest.fixture(autouse=True)
-def _mock_hardware():
-    """Avoid hardware/WinML SDK probing during EP/device resolution."""
-    mock_registry = MagicMock()
-    mock_registry.is_ep_available.return_value = False
+def _mock_resolve_device():
+    """Stub device resolution so ``--device auto`` deterministically maps to the
+    NPU without probing real hardware. Tests needing a different resolution
+    override this patch locally.
+    """
     with (
+        patch(_RESOLVE_DEVICE_TARGET, return_value=_NPU_TARGET),
         patch(
-            "winml.modelkit.sysinfo.resolve_device",
-            return_value=("npu", ["npu", "gpu", "cpu"]),
-        ),
-        patch(
-            "winml.modelkit.sysinfo.resolve_eps",
-            side_effect=lambda device: list(_DEVICE_TO_EPS.get(device, [])),
-        ),
-        patch(
-            "winml.modelkit.sysinfo.resolve_check_device_ep",
-            side_effect=_fake_resolve_check_device_ep,
-        ),
-        patch(
-            "winml.modelkit.session.ep_registry.WinMLEPRegistry.get_instance",
-            return_value=mock_registry,
+            "winml.modelkit.sysinfo.hardware.get_available_devices",
+            return_value=["npu", "gpu", "cpu"],
         ),
     ):
         yield
@@ -182,7 +167,7 @@ def test_registered_family_npu_qnn_routes_to_bundle(tmp_path: Path):
     assert kwargs["device"] == "npu"
     assert kwargs["force_rebuild"] is False
     assert kwargs["precision"] is None
-    assert callable(kwargs["emit"])
+    assert "emit" not in kwargs
 
 
 def test_explicit_config_file_is_rejected_for_bundle(tmp_path: Path):
@@ -398,7 +383,7 @@ def test_auto_qnn_resolving_to_non_npu_does_not_route(tmp_path: Path):
         patch(_BUNDLE_TARGET) as bundle,
         patch(_RUN_SINGLE_TARGET) as run_single,
         patch(_COMPOSITE_TARGET, return_value=None),
-        patch("winml.modelkit.sysinfo.resolve_device", return_value=("cpu", ["cpu"])),
+        patch(_RESOLVE_DEVICE_TARGET, return_value=_CPU_TARGET),
     ):
         result = _invoke(
             [
@@ -451,7 +436,7 @@ def test_qnn_without_device_resolving_to_non_npu_does_not_route(tmp_path: Path):
         patch(_BUNDLE_TARGET) as bundle,
         patch(_RUN_SINGLE_TARGET) as run_single,
         patch(_COMPOSITE_TARGET, return_value=None),
-        patch("winml.modelkit.sysinfo.resolve_device", return_value=("cpu", ["cpu"])),
+        patch(_RESOLVE_DEVICE_TARGET, return_value=_CPU_TARGET),
     ):
         result = _invoke(["-m", "Qwen/Qwen3-0.6B", "-o", str(tmp_path / "o"), "--ep", "qnn"])
 
@@ -584,10 +569,7 @@ def test_export_type_optimized_errors_when_resolved_target_unsupported(tmp_path:
         patch(_BUNDLE_TARGET) as bundle,
         patch(_RUN_SINGLE_TARGET) as run_single,
         patch(_COMPOSITE_TARGET, return_value=None),
-        patch(
-            "winml.modelkit.sysinfo.resolve_check_device_ep",
-            return_value=("cpu", ["npu", "gpu", "cpu"], ["CPUExecutionProvider"]),
-        ) as probe,
+        patch(_RESOLVE_DEVICE_TARGET, return_value=_CPU_TARGET) as probe,
     ):
         result = _invoke(
             ["-m", "Qwen/Qwen3-0.6B", "-o", str(tmp_path / "o"), "--export-type", "optimized"]
@@ -616,7 +598,7 @@ def test_export_type_optimized_explicit_target_builds_on_non_npu_host(tmp_path: 
         patch(_BUNDLE_TARGET, side_effect=_record_bundle(recorded)) as bundle,
         patch(_RUN_SINGLE_TARGET) as run_single,
         patch(_COMPOSITE_TARGET, return_value=None),
-        patch("winml.modelkit.sysinfo.resolve_device", return_value=("cpu", ["cpu"])),
+        patch(_RESOLVE_DEVICE_TARGET, return_value=_CPU_TARGET),
     ):
         result = _invoke(
             [
@@ -817,3 +799,59 @@ def test_optimized_requires_model():
             rebuild=False,
             submodel=None,
         )
+
+
+def test_build_genai_bundle_worker_reports_completed_config(tmp_path: Path) -> None:
+    from winml.modelkit.commands.build import _build_genai_bundle_worker
+    from winml.modelkit.models import winml as winml_models
+
+    config_path = tmp_path / "genai_config.json"
+    config_path.write_text("{}", encoding="utf-8")
+    result_conn = MagicMock()
+
+    with patch.object(winml_models, "build_genai_bundle", return_value=config_path) as build:
+        _build_genai_bundle_worker(
+            result_conn,
+            "Qwen/Qwen3-0.6B",
+            str(tmp_path),
+            object(),
+            {"ep": "vitisai", "device": "npu"},
+        )
+
+    build.assert_called_once()
+    assert build.call_args.kwargs["emit"] is print
+    result_conn.send.assert_called_once_with(("ok", str(config_path)))
+    result_conn.close.assert_called_once()
+
+
+def test_isolated_build_salvages_config_after_native_teardown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from winml.modelkit.commands.build import _build_genai_bundle_isolated
+
+    config_path = tmp_path / "genai_config.json"
+    config_path.write_text("{}", encoding="utf-8")
+
+    recv_conn = MagicMock()
+    recv_conn.poll.return_value = True
+    recv_conn.recv.return_value = ("ok", str(config_path))
+    send_conn = MagicMock()
+    proc = MagicMock(exitcode=-1073741819)
+    ctx = MagicMock()
+    ctx.Pipe.return_value = (recv_conn, send_conn)
+    ctx.Process.return_value = proc
+    monkeypatch.setattr("multiprocessing.get_context", lambda _method: ctx)
+
+    result = _build_genai_bundle_isolated(
+        "Qwen/Qwen3-0.6B",
+        tmp_path,
+        object(),
+        ep="vitisai",
+        device="npu",
+    )
+
+    assert result == config_path
+    proc.start.assert_called_once()
+    proc.join.assert_called_once()
+    send_conn.close.assert_called_once()
+    recv_conn.close.assert_called_once()

@@ -192,7 +192,7 @@ class WinMLMaskGenerationEvaluator(WinMLEvaluator):
         # contract and CodeQL's ``py/missing-call-to-init`` rule.  The
         # base ``prepare_pipeline`` is overridden here to return ``None``,
         # so it is safe to call from ``WinMLEvaluator.__init__``.
-        super().__init__(config, model)  # type: ignore[arg-type]
+        super().__init__(config, model)
 
     # ------------------------------------------------------------------
     # WinMLEvaluator overrides
@@ -671,11 +671,11 @@ def _build_providers(
     """
     import onnxruntime as ort
 
-    from ..sysinfo import resolve_eps
+    from ..session import available_eps_for_device
     from ..utils.constants import EP_SUPPORTED_DEVICES, normalize_ep_name
 
     if ep is None:
-        compatible = resolve_eps(device)
+        compatible = available_eps_for_device(device)
         if not compatible:
             raise ValueError(
                 f"No execution provider is available for device {device!r}. "

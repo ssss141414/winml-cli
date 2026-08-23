@@ -93,6 +93,13 @@ def _warn_partial_composite(completed: list[Path]) -> None:
 @cli_utils.output_option("Output ONNX file path (e.g., model.onnx)", required=True)
 @cli_utils.overwrite_option()
 @click.option(
+    "--batch-size",
+    type=click.IntRange(min=1),
+    default=1,
+    show_default=True,
+    help="Static batch size for generated model inputs.",
+)
+@click.option(
     "--with-report/--no-with-report",
     default=False,
     show_default=True,
@@ -164,6 +171,7 @@ def export(
     model: str,
     output: Path,
     overwrite: bool,
+    batch_size: int,
     verbose: int,
     quiet: bool,
     with_report: bool,
@@ -270,7 +278,12 @@ def export(
         if not cli_utils.is_cli_provided(ctx, "dynamo") and "dynamo" in ec:
             dynamo = ec["dynamo"]
 
-    from ..export import InputTensorSpec, OutputTensorSpec, WinMLExportConfig
+    from ..export import (
+        InputTensorSpec,
+        OutputTensorSpec,
+        WinMLExportConfig,
+        resolve_export_compatibility,
+    )
     from ..export import export_pytorch as export_onnx
     from ..loader import load_hf_model
 
@@ -316,6 +329,16 @@ def export(
         dynamic_axes_dict = cli_utils.load_json_object(dynamic_axes, "--dynamic-axes")
         console.print(f"[dim]Dynamic axes: {dynamic_axes_dict}[/dim]")
 
+    effective_batch_size = batch_size
+    if not cli_utils.is_cli_provided(ctx, "batch_size"):
+        effective_batch_size = _build_export_dict.get("batch_size", effective_batch_size)
+        effective_batch_size = export_config_dict.get("batch_size", effective_batch_size)
+    if not isinstance(effective_batch_size, int) or effective_batch_size <= 0:
+        raise click.ClickException(
+            f"Configuration error: batch_size must be a positive integer, got "
+            f"{effective_batch_size!r}"
+        )
+
     # One-time warnings (apply to every sub-model in a composite export).
     if torch_module:
         console.print(
@@ -350,6 +373,7 @@ def export(
             auto_export_cfg, _ = resolve_cfg(
                 model_id=model,
                 task=component_task,
+                batch_size=effective_batch_size,
                 shape_config=shape_overrides,
             )
             if auto_export_cfg.input_tensors:
@@ -419,6 +443,8 @@ def export(
             config_kwargs["verbose"] = bool(verbose)
         if cli_utils.is_cli_provided(ctx, "dynamo"):
             config_kwargs["dynamo"] = dynamo
+        if cli_utils.is_cli_provided(ctx, "batch_size"):
+            config_kwargs["batch_size"] = batch_size
         if dynamic_axes_dict is not None:
             config_kwargs["dynamic_axes"] = dynamic_axes_dict
 
@@ -430,6 +456,8 @@ def export(
 
         try:
             cfg = WinMLExportConfig.from_dict(config_kwargs)
+            if not cfg.compatibility:
+                cfg.compatibility = resolve_export_compatibility()
         except Exception as e:
             console.print(f"[bold red]Configuration error:[/bold red] {e}")
             logger.exception("Failed to create export config")
