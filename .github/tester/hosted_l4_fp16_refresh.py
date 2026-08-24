@@ -204,7 +204,17 @@ if not semantics["success"] or semantics["model_sha256"] != ARTIFACT_SHA:
     fail("fresh fp16 semantic checks failed")
 
 providers = run("providers", [str(python), "-c", "import onnxruntime as ort; print(ort.get_available_providers())"], candidate, 120)
-perf = run("perf-fp16", [str(python), "-m", "winml.modelkit", "perf", "-m", str(target_model), "--ep", "cpu", "--device", "cpu", "--warmup", "2", "--iterations", "10"], candidate, 900)
+precision_perf_code = r'''
+import subprocess, sys
+import onnx
+from winml.modelkit.session.session import WinMLSession
+model_path = sys.argv[1]
+precision = WinMLSession._get_precision(onnx.load(model_path, load_external_data=False))
+print(f"Model Precision: {precision}", flush=True)
+completed = subprocess.run([sys.executable, "-m", "winml.modelkit", "perf", "-m", model_path, "--ep", "cpu", "--device", "cpu", "--warmup", "2", "--iterations", "10"], check=False)
+raise SystemExit(completed.returncode)
+'''
+perf = run("perf-fp16", [str(python), "-c", precision_perf_code, str(target_model)], candidate, 900)
 plain = re.sub(r"\x1b\[[0-9;?]*[ -/]*[@-~]", "", combined(perf))
 precision = re.search(r"Model Precision:\s*(\S+)", plain)
 latency = re.search(r"│\s*([0-9.]+)\s*│\s*([0-9.]+)\s*│\s*([0-9.]+)\s*│\s*([0-9.]+)\s*│\s*([0-9.]+)\s*│\s*([0-9.]+)\s*│\s*([0-9.]+)\s*│", plain)
