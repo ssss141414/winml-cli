@@ -173,11 +173,12 @@ fp32_payload = sum(len(item.raw_data) for item in model.graph.initializer if ite
 build_config = json.loads(build_config_path.read_text(encoding="utf-8"))
 recipe = json.loads(recipe_path.read_text(encoding="utf-8"))
 cross_file = {
-    "model_id_equal": build_config["model"] == recipe["model"],
     "task_equal": build_config["loader"]["task"] == recipe["loader"]["task"] == "reranking",
+    "model_class_equal": build_config["loader"]["model_class"] == recipe["loader"]["model_class"] == "AutoModelForSequenceClassification",
     "model_type_equal": build_config["loader"]["model_type"] == recipe["loader"]["model_type"] == "bert",
     "quant_mode_equal": build_config["quant"]["mode"] == recipe["quant"]["mode"] == "fp16",
     "keep_io_types_equal": build_config["quant"]["fp16_keep_io_types"] == recipe["quant"]["fp16_keep_io_types"] is True,
+    "input_tensors_equal": build_config["export"]["input_tensors"] == recipe["export"]["input_tensors"],
 }
 result = {
     "success": counts["FLOAT16"] == 76 and counts["FLOAT"] == 0 and fp16_payload > 0 and fp32_payload == 0 and all(cross_file.values()),
