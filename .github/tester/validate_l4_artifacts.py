@@ -52,7 +52,7 @@ checks = {
     "fp16_output": fp16["outputs"] == [{"name": "logits", "dtype": "FLOAT", "shape": [1, 1]}],
     "fp32_float_initializers": fp32["initializer_types"].get("FLOAT", 0) > 0,
     "fp16_float16_initializers": fp16["initializer_types"].get("FLOAT16", 0) > 0,
-    "fp16_smaller": fp16["directory_bytes"] < fp32["directory_bytes"] * 0.7,
+    "fp16_smaller": fp16["model_bytes"] < fp32["model_bytes"] * 0.7,
 }
 result = {"fp32": fp32, "fp16": fp16, "checks": checks, "success": all(checks.values())}
 output.write_text(json.dumps(result, indent=2), encoding="utf-8")

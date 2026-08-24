@@ -2,7 +2,7 @@ name: Tester L4 validation only
 
 on:
   push:
-    branches: [tester-validation-l4-b71e25c8]
+    branches: [tester-validation-l4-4c68f03a]
 
 permissions:
   contents: read
@@ -49,7 +49,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: tester-l4-d951fcca-evidence
+          name: tester-l4-d951fcca-evidence-4c68f03a
           path: hosted-evidence
           if-no-files-found: error
           retention-days: 7
