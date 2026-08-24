@@ -2,7 +2,7 @@ name: Tester L4 validation only
 
 on:
   push:
-    branches: [tester-validation-l4-4c68f03a]
+    branches: [tester-validation-l4-fp16-e82a41c6]
 
 permissions:
   contents: read
@@ -39,17 +39,17 @@ jobs:
       - name: Set up Python
         run: uv python install 3.11
 
-      - name: Run complete tester acceptance
+      - name: Run exact-artifact fp16 tester refresh
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python controller/.github/tester/hosted_l4_controller.py
+        run: python controller/.github/tester/hosted_l4_fp16_refresh.py
 
-      - name: Upload complete tester evidence
+      - name: Upload fp16 tester refresh evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: tester-l4-d951fcca-evidence-4c68f03a
-          path: hosted-evidence
+          name: tester-l4-d951fcca-fp16-refresh-e82a41c6
+          path: hosted-evidence-fp16-refresh
           if-no-files-found: error
           retention-days: 7
